@@ -85,6 +85,7 @@ Common optional variables:
 | `SYNC_VMS` / `SYNC_LXC` / `SYNC_TAGS` | `true` | Enable/disable each sync type |
 | `DRY_RUN` | `false` | Log changes without writing to NetBox |
 | `ENABLE_CLEANUP` | `false` | Delete from NetBox VMs missing in PVE (**use with care**) |
+| `PRESERVE_EXTRA_TAGS` | `false` | Keep NetBox VM tags that are not in Proxmox (merge instead of overwrite) |
 | `LOG_LEVEL` | `INFO` | `DEBUG` / `INFO` / `WARNING` / `ERROR` |
 | `ENABLE_METRICS` / `METRICS_PORT` | `false` / `9090` | Prometheus metrics on `/metrics` |
 | `PRIMARY_SUBNETS` | — | Comma/space-separated subnets used to pick `primary_ip4`/`primary_ip6` (first matching subnet wins, IPv4/IPv6 independent). Empty = leave `primary_ip*` untouched. Example: `192.168.88.0/24, 2001:db8::/64` |
@@ -127,7 +128,7 @@ Hits the Proxmox VE API, reads VMs/LXC, and creates/updates NetBox objects accor
 - **QEMU VMs** — disks (SCSI/SATA/VirtIO/IDE/EFI), NICs with VLAN and MTU, IPs via QEMU Guest Agent (interfaces matched by MAC).
 - **LXC containers** — rootfs and mount points (`mp0`, `mp1`…), NICs with MTU. IP sync not available (no guest agent).
 
-**QEMU Guest Agent** (when `agent=1` and VM is running): real OS interface names (e.g. `eth0`) instead of `net0`, MAC-based matching, IPv4/IPv6 assignment to NetBox interfaces.
+**QEMU Guest Agent** (when `agent=1` and VM is running): real OS interface names (e.g. `eth0`) instead of `net0`, MAC-based matching, IPv4/IPv6 assignment to NetBox interfaces. The VM name is written to each IP's `description`. VRRP/HSRP VIPs already existing in NetBox (e.g. with `role=vrrp`) are re-linked to the VM being synced instead of failing the cycle.
 
 **Auto-created in NetBox on first run:**
 

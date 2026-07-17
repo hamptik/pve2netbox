@@ -44,6 +44,7 @@ class Config:
     enable_metrics: bool
     metrics_port: int
     ignore_status_when_locked: bool
+    preserve_extra_tags: bool
     primary_subnets: Tuple[IPNetwork, ...] = field(default_factory=tuple)
 
 
@@ -116,6 +117,7 @@ def load_config() -> Config:
             enable_metrics=os.getenv('ENABLE_METRICS', 'false').lower() == 'true',
             metrics_port=int(os.getenv('METRICS_PORT', '9090')),
             ignore_status_when_locked=os.getenv('IGNORE_STATUS_WHEN_LOCKED', 'true').lower() == 'true',
+            preserve_extra_tags=os.getenv('PRESERVE_EXTRA_TAGS', 'false').lower() == 'true',
             primary_subnets=primary_subnets,
         )
     except (ValueError, TypeError) as e:

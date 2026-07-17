@@ -286,6 +286,38 @@ def _ensure_nb_tag(tag_name: str, _nb_api: pynetbox.api, _nb_objects: dict) -> N
     _nb_objects['tags'][_nb_tag.name] = _nb_tag
 
 
+def _compute_vm_tags(_nb_virtual_machine: Optional[Any], _pve_tags: list, _nb_objects: dict) -> list:
+    """
+    Build the final list of NetBox tag IDs to assign to a VM.
+
+    When ``PRESERVE_EXTRA_TAGS`` is enabled, returns the union of:
+    - tags currently set on the NetBox VM (manual tags preserved)
+    - tags coming from Proxmox (pool + PVE tags)
+
+    When disabled (default), returns only Proxmox tags, matching legacy behavior.
+    """
+    pve_tag_ids = list(map(
+        lambda _pve_tag_name: _nb_objects['tags'][_pve_tag_name].id,
+        _pve_tags,
+    ))
+
+    if not (_config and _config.preserve_extra_tags):
+        return pve_tag_ids
+
+    if _nb_virtual_machine is None:
+        return pve_tag_ids
+
+    existing_tag_ids = set()
+    current_tags = getattr(_nb_virtual_machine, 'tags', None) or []
+    for _tag in current_tags:
+        tag_id = _tag.id if hasattr(_tag, 'id') else _tag
+        existing_tag_ids.add(tag_id)
+
+    # Preserve any existing tag, even if not coming from PVE.
+    merged_ids = existing_tag_ids | set(pve_tag_ids)
+    return list(merged_ids)
+
+
 def _is_pve_entity_transiently_locked(_pve_entity: dict) -> bool:
     """
     Return True if PVE reports a transient ``lock`` that can briefly flip ``status``
@@ -390,7 +422,7 @@ def _process_pve_lxc_container(
             # creation so we don't persist a transient 'active'.
             'status': 'offline' if is_locked
                       else ('active' if _pve_container['status'] == 'running' else 'offline'),
-            'tags': list(map(lambda _pve_tag_name: _nb_objects['tags'][_pve_tag_name].id, _pve_tags)),
+            'tags': _compute_vm_tags(None, _pve_tags, _nb_objects),
             'custom_fields': {
                 'autostart': pve_container_config.get('onboot') == 1,
                 'replicated': _is_replicated,
@@ -417,7 +449,7 @@ def _process_pve_lxc_container(
             )
         else:
             nb_virtual_machine.status = 'active' if _pve_container['status'] == 'running' else 'offline'
-        nb_virtual_machine.tags = list(map(lambda _pve_tag_name: _nb_objects['tags'][_pve_tag_name].id, _pve_tags))
+        nb_virtual_machine.tags = _compute_vm_tags(nb_virtual_machine, _pve_tags, _nb_objects)
         if lxc_role_id:
             nb_virtual_machine.role = lxc_role_id
         nb_virtual_machine.custom_fields['autostart'] = pve_container_config.get('onboot') == 1
@@ -478,6 +510,7 @@ def _process_pve_virtual_machine(
                 mac_address = iface.get('hardware-address', '').lower()
                 if not mac_address:
                     continue
+                iface_name = iface.get('name')
                 ip_addresses = []
                 for ip_info in iface.get('ip-addresses', []):
                     ip_type = ip_info.get('ip-address-type', '')
@@ -491,11 +524,27 @@ def _process_pve_virtual_machine(
                             'type': ip_type,
                         })
                 
-                agent_data_by_mac[mac_address] = {
-                    'interface_name': iface.get('name'),
-                    'ip_addresses': ip_addresses,
-                }
-                logger.debug(f'        Agent: {iface.get("name")} ({mac_address}) - {len(ip_addresses)} IP(s)')
+                # Interfaces sharing the same MAC (e.g. eth0 + eth0:vip0 VRRP alias,
+                # or eth0 + eth0.100 VLAN) are merged into a single record.
+                # Otherwise later entry overwrites earlier one and we lose IPs,
+                # which then get deleted as "stale" in the next step.
+                if mac_address in agent_data_by_mac:
+                    existing = agent_data_by_mac[mac_address]
+                    existing['ip_addresses'].extend(ip_addresses)
+                    # Prefer the "base" interface name (no ':' alias suffix) as canonical.
+                    existing_name = existing.get('interface_name', '')
+                    if ':' in existing_name and ':' not in iface_name:
+                        existing['interface_name'] = iface_name
+                    logger.debug(
+                        f'        Agent: merged {iface_name} into {existing_name} '
+                        f'({mac_address}) +{len(ip_addresses)} IP(s)'
+                    )
+                else:
+                    agent_data_by_mac[mac_address] = {
+                        'interface_name': iface_name,
+                        'ip_addresses': ip_addresses,
+                    }
+                    logger.debug(f'        Agent: {iface_name} ({mac_address}) - {len(ip_addresses)} IP(s)')
                 
         except (ResourceException, KeyError, AttributeError) as e:
             logger.warning(f'      Warning: Failed to get QEMU agent data: {e}')
@@ -518,12 +567,12 @@ def _process_pve_virtual_machine(
             'cluster': os.environ.get('NB_CLUSTER_ID', 1),
             'device': _nb_device.id,
             'vcpus': _get_virtual_machine_vcpus(pve_virtual_machine_config),
-            'memory': int(pve_virtual_machine_config['memory']),
+            'memory': int(pve_virtual_machine_config.get('memory', 0) or 0),
             # While locked (e.g. backup) PVE status can flip; fall back to 'offline' for
             # creation so we don't persist a transient 'active'.
             'status': 'offline' if is_locked
                       else ('active' if _pve_virtual_machine['status'] == 'running' else 'offline'),
-            'tags': list(map(lambda _pve_tag_name: _nb_objects['tags'][_pve_tag_name].id, _pve_tags)),
+            'tags': _compute_vm_tags(None, _pve_tags, _nb_objects),
             'custom_fields': {
                 'autostart': pve_virtual_machine_config.get('onboot') == 1,
                 'replicated': _is_replicated,
@@ -542,7 +591,7 @@ def _process_pve_virtual_machine(
         nb_virtual_machine.cluster = os.environ.get('NB_CLUSTER_ID', 1)
         nb_virtual_machine.device = _nb_device.id
         nb_virtual_machine.vcpus = _get_virtual_machine_vcpus(pve_virtual_machine_config)
-        nb_virtual_machine.memory = int(pve_virtual_machine_config['memory'])
+        nb_virtual_machine.memory = int(pve_virtual_machine_config.get('memory', 0) or 0)
         if is_locked:
             logger.debug(
                 f'      VM {_pve_virtual_machine["vmid"]} is locked '
@@ -550,7 +599,7 @@ def _process_pve_virtual_machine(
             )
         else:
             nb_virtual_machine.status = 'active' if _pve_virtual_machine['status'] == 'running' else 'offline'
-        nb_virtual_machine.tags = list(map(lambda _pve_tag_name: _nb_objects['tags'][_pve_tag_name].id, _pve_tags))
+        nb_virtual_machine.tags = _compute_vm_tags(nb_virtual_machine, _pve_tags, _nb_objects)
         if vm_role_id:
             nb_virtual_machine.role = vm_role_id
         nb_virtual_machine.custom_fields['autostart'] = pve_virtual_machine_config.get('onboot') == 1
@@ -641,36 +690,58 @@ def _resolve_primary_ip_assignments(
         _agent_data_by_mac: dict,
 ) -> None:
     """
-    Set ``primary_ip4``/``primary_ip6`` on a VM based on configured
-    ``PRIMARY_SUBNETS``. If no subnets are configured, do nothing — current
-    NetBox values (manual or already set) are left untouched.
+    Set ``primary_ip4``/``primary_ip6`` on a VM based on QEMU guest-agent data.
 
-    Subnet order defines priority: for each subnet (in order) the first
-    matching IP from QEMU guest-agent data assigned in NetBox is picked.
-    Within a subnet candidate IPs are sorted, so the result is deterministic
-    regardless of the order Proxmox/agent returns interfaces.
+    Selection rules (in priority order):
+
+    1. If ``PRIMARY_SUBNETS`` is configured — first matching IP per family
+       wins (IPv4 and IPv6 independent, subnet order defines priority).
+    2. Otherwise — first non-VIP IPv4 (and IPv6) attached to any VM interface
+       is picked. ``/32`` IPv4 from the agent is treated as a VRRP/HSRP VIP
+       alias and skipped, so primary never lands on a virtual address.
+
+    Within a subnet (or within the fallback pool) candidates are sorted, so
+    the result is deterministic regardless of the order Proxmox/agent
+    returns interfaces.
     """
     primary_subnets = _config.primary_subnets if _config is not None else ()
-    if not primary_subnets:
-        return
 
+    # Build candidate lists from agent data, cross-referenced with NetBox cache.
+    # Cache lookup is by host (without prefix) so VIP /32 from agent can match
+    # the /24 record previously synced (or manually created) in NetBox.
     candidates_v4 = []
     candidates_v6 = []
+    vm_interface_ids = {
+        iface.id for iface in _nb_objects['virtual_machines_interfaces']
+            .get(_nb_virtual_machine.id, {}).values()
+    }
+
     for agent_data in _agent_data_by_mac.values():
         for ip_info in agent_data.get('ip_addresses', []):
             addr = ip_info.get('address')
             prefix = ip_info.get('prefix')
             if not addr or prefix is None:
                 continue
-            full_address = f'{addr}/{prefix}'
-            nb_ip = _nb_objects['ip_addresses'].get(full_address)
-            if nb_ip is None:
-                continue
             try:
-                ip_obj = ipaddress.ip_interface(full_address).ip
+                ip_obj = ipaddress.ip_interface(f'{addr}/{prefix}').ip
             except ValueError:
                 continue
-            entry = (ip_obj, nb_ip.id, full_address)
+
+            # Find the matching NetBox IP record (by host, since prefix may differ
+            # between agent report and NetBox storage).
+            nb_ip = None
+            for full_addr, candidate in _nb_objects['ip_addresses'].items():
+                if full_addr.split('/')[0] != str(ip_obj):
+                    continue
+                assigned_id = getattr(candidate, 'assigned_object_id', None)
+                if assigned_id in vm_interface_ids:
+                    nb_ip = candidate
+                    break
+            if nb_ip is None:
+                continue
+
+            full_address = nb_ip.address  # canonical "<ip>/<prefix>" from NetBox
+            entry = (ip_obj, nb_ip.id, full_address, prefix)
             if ip_obj.version == 4:
                 candidates_v4.append(entry)
             else:
@@ -681,18 +752,33 @@ def _resolve_primary_ip_assignments(
 
     chosen_v4 = None
     chosen_v6 = None
-    for subnet in primary_subnets:
-        if subnet.version == 4 and chosen_v4 is None:
-            for ip_obj, nb_ip_id, full_address in candidates_v4:
-                if ip_obj in subnet:
-                    chosen_v4 = (nb_ip_id, full_address, subnet)
-                    break
-        elif subnet.version == 6 and chosen_v6 is None:
-            for ip_obj, nb_ip_id, full_address in candidates_v6:
-                if ip_obj in subnet:
-                    chosen_v6 = (nb_ip_id, full_address, subnet)
-                    break
-        if chosen_v4 is not None and chosen_v6 is not None:
+
+    if primary_subnets:
+        for subnet in primary_subnets:
+            if subnet.version == 4 and chosen_v4 is None:
+                for ip_obj, nb_ip_id, full_address, _prefix in candidates_v4:
+                    if ip_obj in subnet:
+                        chosen_v4 = (nb_ip_id, full_address, subnet)
+                        break
+            elif subnet.version == 6 and chosen_v6 is None:
+                for ip_obj, nb_ip_id, full_address, _prefix in candidates_v6:
+                    if ip_obj in subnet:
+                        chosen_v6 = (nb_ip_id, full_address, subnet)
+                        break
+            if chosen_v4 is not None and chosen_v6 is not None:
+                break
+    else:
+        # Fallback: pick the first non-VIP IPv4. Heuristic: agent reports VIP
+        # aliases with prefix /32 (no own netmask). Same idea for IPv6 /128.
+        for ip_obj, nb_ip_id, full_address, prefix in candidates_v4:
+            if prefix == 32:
+                continue
+            chosen_v4 = (nb_ip_id, full_address, 'fallback')
+            break
+        for ip_obj, nb_ip_id, full_address, prefix in candidates_v6:
+            if prefix == 128:
+                continue
+            chosen_v6 = (nb_ip_id, full_address, 'fallback')
             break
 
     needs_save = False
@@ -716,6 +802,37 @@ def _resolve_primary_ip_assignments(
             )
     if needs_save:
         _nb_virtual_machine.save()
+
+
+def _fetch_existing_ip_address(_nb_api: pynetbox.api, _address: str):
+    """
+    Query NetBox for an existing IP address by exact address string.
+
+    Used when ``ipam.ip_addresses.create()`` fails with the
+    "Duplicate IP address found in global table" error: the duplicate lives
+    outside the local cache (e.g. quick sync only loads current VM's IPs).
+
+    The lookup is done by IP only (without prefix), because the same IP can be
+    stored in NetBox with a different prefix (e.g. agent reports VIP as /32
+    while NetBox has it as /24). When multiple records exist, the first match
+    is returned.
+
+    Returns the IP object or ``None`` if not found.
+    """
+    ip_part = _address.split('/')[0]
+    try:
+        matches = list(_nb_api.ipam.ip_addresses.filter(address=ip_part))
+    except Exception as exc:
+        logger.warning(f'      Warning: failed to look up existing IP {_address}: {exc}')
+        return None
+    return matches[0] if matches else None
+
+
+def _is_duplicate_ip_error(exc: Exception) -> bool:
+    """Return True if the exception is a NetBox 400 about a duplicate IP in global table."""
+    if not isinstance(exc, pynetbox.RequestError):
+        return False
+    return 'Duplicate IP address' in str(exc)
 
 
 def _process_pve_virtual_machine_network_interface(
@@ -851,24 +968,29 @@ def _process_pve_virtual_machine_network_interface(
     has_agent_match = bool(_agent_interface_data)
 
     if has_agent_match:
-        desired_interface_ips = set()
+        # Compare by IP host only (without prefix). The QEMU guest agent reports
+        # VIP aliases with /32 (no own netmask), while NetBox may store the same
+        # IP with /24 (inheriting the parent interface mask). Comparing the full
+        # ``address/prefix`` string would delete those records as "stale" and
+        # lose the IP — see the VRRP VIP regression.
+        desired_interface_ip_hosts = set()
         for ip_info in agent_ip_addresses:
             ip_addr = ip_info.get('address')
-            ip_prefix = ip_info.get('prefix')
-            if ip_addr and ip_prefix is not None:
-                desired_interface_ips.add(f'{ip_addr}/{ip_prefix}')
+            if ip_addr:
+                desired_interface_ip_hosts.add(str(ip_addr).split('/')[0])
 
         # Keep NetBox interface IPs aligned with guest agent state.
         for nb_ip in list(_nb_objects['ip_addresses'].values()):
             assigned_type = getattr(nb_ip, 'assigned_object_type', None)
             assigned_id = getattr(nb_ip, 'assigned_object_id', None)
             ip_address = str(getattr(nb_ip, 'address', ''))
+            ip_host = ip_address.split('/')[0]
 
             if assigned_type != 'virtualization.vminterface':
                 continue
             if assigned_id != nb_virtual_machines_interface.id:
                 continue
-            if ip_address in desired_interface_ips:
+            if ip_host in desired_interface_ip_hosts:
                 continue
 
             vm_needs_save = False
@@ -892,26 +1014,43 @@ def _process_pve_virtual_machine_network_interface(
     if not agent_ip_addresses:
         logger.debug(f'        Interface {_interface_name}: no IP addresses from guest agent')
         return _nb_objects
-    primary_ipv4 = None
-    ipv4_count = 0
-    ipv6_count = 0
+
+    def _is_link_local(addr: str) -> bool:
+        """Filter out APIPA/link-local and loopback addresses the agent may report."""
+        try:
+            ip = ipaddress.ip_address(addr)
+        except ValueError:
+            return True
+        return ip.is_link_local or ip.is_loopback
+
+    ipv4_list = [
+        ip for ip in agent_ip_addresses
+        if ip.get('type') == 'ipv4' and not _is_link_local(ip.get('address', ''))
+    ]
+    ipv6_count = sum(1 for ip in agent_ip_addresses if ip.get('type') == 'ipv6')
     
-    for ip_info in agent_ip_addresses:
-        if ip_info.get('type') == 'ipv4':
-            ipv4_count += 1
-            if primary_ipv4 is None:
-                primary_ipv4 = ip_info
-        elif ip_info.get('type') == 'ipv6':
-            ipv6_count += 1
+    logger.debug(f'        Interface {_interface_name}: {len(ipv4_list)} IPv4, {ipv6_count} IPv6 from guest agent')
     
-    logger.debug(f'        Interface {_interface_name}: {ipv4_count} IPv4, {ipv6_count} IPv6 from guest agent')
-    
-    if primary_ipv4 is not None:
-        _virtual_machine_address = primary_ipv4['address']
-        _virtual_machine_address_mask = primary_ipv4['prefix']
+    # Sync all IPv4 addresses reported by the guest agent for this interface.
+    # Primary (first in agent order) gets the same detailed conflict handling as
+    # before; secondaries are also linked so VIPs and multi-homed interfaces
+    # are represented in NetBox.
+    for ipv4_info in ipv4_list:
+        _virtual_machine_address = ipv4_info['address']
+        _virtual_machine_address_mask = ipv4_info['prefix']
         _virtual_machine_full_address = f'{_virtual_machine_address}/{_virtual_machine_address_mask}'
-        _prefix_network_address = '.'.join(_virtual_machine_address.split('.')[:-1]) + '.0'
-        _prefix_network_full_address = f'{_prefix_network_address}/{_virtual_machine_address_mask}'
+        # Compute the network prefix correctly (e.g. 10.15.11.221/24 -> 10.15.11.0/24).
+        # The legacy '.'.join() approach silently broke for /16, /8 and link-local
+        # networks (e.g. produced 169.254.49.0/16 instead of 169.254.0.0/16).
+        try:
+            _iface_net = ipaddress.ip_interface(_virtual_machine_full_address).network
+            _prefix_network_full_address = str(_iface_net)
+        except ValueError:
+            logger.warning(
+                f'      Skipping invalid IPv4 {_virtual_machine_full_address} '
+                f'on interface {_interface_name}'
+            )
+            continue
 
         nb_prefix = _nb_objects['prefixes'].get(_prefix_network_full_address)
         if nb_prefix is None:
@@ -925,95 +1064,132 @@ def _process_pve_virtual_machine_network_interface(
 
         nb_ip_address = _nb_objects['ip_addresses'].get(_virtual_machine_full_address)
         if nb_ip_address is None:
-            nb_ip_address = _nb_api.ipam.ip_addresses.create(
-                address=_virtual_machine_full_address,
-                assigned_object_type='virtualization.vminterface',
-                assigned_object_id=nb_virtual_machines_interface.id,
-                dns_name=ip_address_dns_name
-            )
-            _nb_objects['ip_addresses'][nb_ip_address.address] = nb_ip_address
-            logger.info(f'        ✓ Created IP {_virtual_machine_full_address} on interface {_interface_name}')
-        else:
-            if nb_ip_address.assigned_object_id != nb_virtual_machines_interface.id:
-                try:
-                    old_interface = _nb_api.virtualization.interfaces.get(nb_ip_address.assigned_object_id)
-                    if old_interface and old_interface.virtual_machine.id != _nb_virtual_machine.id:
-                        old_vm = old_interface.virtual_machine
-                        old_vm_status = old_vm.status.value if hasattr(old_vm, 'status') and hasattr(old_vm.status, 'value') else (old_vm.status if hasattr(old_vm, 'status') else 'unknown')
-                        current_vm_status = _nb_virtual_machine.status.value if hasattr(_nb_virtual_machine, 'status') and hasattr(_nb_virtual_machine.status, 'value') else (_nb_virtual_machine.status if hasattr(_nb_virtual_machine, 'status') else 'unknown')
-                        old_ip_vrf = nb_ip_address.vrf.id if hasattr(nb_ip_address, 'vrf') and nb_ip_address.vrf else None
-                        new_ip_vrf = nb_prefix.vrf.id if hasattr(nb_prefix, 'vrf') and nb_prefix.vrf else None
-                        if old_ip_vrf != new_ip_vrf:
-                            old_vrf_name = nb_ip_address.vrf.name if old_ip_vrf else 'Global'
-                            new_vrf_name = nb_prefix.vrf.name if new_ip_vrf else 'Global'
-                            logger.info(f'      IP {_virtual_machine_full_address} exists in different VRF:')
-                            logger.info(f'         - Old: VRF "{old_vrf_name}" (VM {old_vm.name})')
-                            logger.info(f'         - New: VRF "{new_vrf_name}" (VM {_nb_virtual_machine.name})')
-                            logger.info(f'      Creating new IP address in VRF "{new_vrf_name}"')
+            try:
+                nb_ip_address = _nb_api.ipam.ip_addresses.create(
+                    address=_virtual_machine_full_address,
+                    assigned_object_type='virtualization.vminterface',
+                    assigned_object_id=nb_virtual_machines_interface.id,
+                    dns_name=ip_address_dns_name,
+                    description=_nb_virtual_machine.name,
+                )
+                _nb_objects['ip_addresses'][nb_ip_address.address] = nb_ip_address
+                logger.info(f'        ✓ Created IP {_virtual_machine_full_address} on interface {_interface_name}')
+                continue
+            except pynetbox.RequestError as exc:
+                if not _is_duplicate_ip_error(exc):
+                    raise
+                logger.info(
+                    f'      IP {_virtual_machine_full_address} already exists in global table; '
+                    f'fetching and re-assigning to {_nb_virtual_machine.name}'
+                )
+                nb_ip_address = _fetch_existing_ip_address(_nb_api, _virtual_machine_full_address)
+                if nb_ip_address is None:
+                    logger.error(
+                        f'      ❌ ERROR: duplicate reported for {_virtual_machine_full_address} '
+                        f'but no existing IP found in NetBox; skipping'
+                    )
+                    continue
+                _nb_objects['ip_addresses'][nb_ip_address.address] = nb_ip_address
+                # Fall through to the reassignment branch below.
+        if nb_ip_address.assigned_object_id != nb_virtual_machines_interface.id:
+            try:
+                old_interface = _nb_api.virtualization.interfaces.get(nb_ip_address.assigned_object_id) \
+                    if nb_ip_address.assigned_object_id else None
+                if old_interface and old_interface.virtual_machine.id != _nb_virtual_machine.id:
+                    old_vm = old_interface.virtual_machine
+                    old_vm_status = old_vm.status.value if hasattr(old_vm, 'status') and hasattr(old_vm.status, 'value') else (old_vm.status if hasattr(old_vm, 'status') else 'unknown')
+                    current_vm_status = _nb_virtual_machine.status.value if hasattr(_nb_virtual_machine, 'status') and hasattr(_nb_virtual_machine.status, 'value') else (_nb_virtual_machine.status if hasattr(_nb_virtual_machine, 'status') else 'unknown')
+                    old_ip_vrf = nb_ip_address.vrf.id if hasattr(nb_ip_address, 'vrf') and nb_ip_address.vrf else None
+                    new_ip_vrf = nb_prefix.vrf.id if hasattr(nb_prefix, 'vrf') and nb_prefix.vrf else None
+                    if old_ip_vrf != new_ip_vrf:
+                        old_vrf_name = nb_ip_address.vrf.name if old_ip_vrf else 'Global'
+                        new_vrf_name = nb_prefix.vrf.name if new_ip_vrf else 'Global'
+                        logger.info(f'      IP {_virtual_machine_full_address} exists in different VRF:')
+                        logger.info(f'         - Old: VRF "{old_vrf_name}" (VM {old_vm.name})')
+                        logger.info(f'         - New: VRF "{new_vrf_name}" (VM {_nb_virtual_machine.name})')
+                        logger.info(f'      Creating new IP address in VRF "{new_vrf_name}"')
+                        try:
                             nb_ip_address = _nb_api.ipam.ip_addresses.create(
                                 address=_virtual_machine_full_address,
                                 assigned_object_type='virtualization.vminterface',
                                 assigned_object_id=nb_virtual_machines_interface.id,
                                 dns_name=ip_address_dns_name,
+                                description=_nb_virtual_machine.name,
                                 vrf=new_ip_vrf
                             )
                             _nb_objects['ip_addresses'][nb_ip_address.address] = nb_ip_address
-                        elif str(old_vm_status).lower() == 'offline':
-                            logger.info(f'      IP {_virtual_machine_full_address} is used by offline VM {old_vm.name} (ID: {old_vm.serial})')
-                            logger.info(f'      Safely re-assigning IP to VM {_nb_virtual_machine.name} (ID: {_nb_virtual_machine.serial})')
-                            try:
-                                old_vm_full = _nb_api.virtualization.virtual_machines.get(old_vm.id)
-                                if old_vm_full:
-                                    needs_save = False
-                                    if hasattr(old_vm_full, 'primary_ip4') and old_vm_full.primary_ip4:
-                                        if old_vm_full.primary_ip4.id == nb_ip_address.id:
-                                            old_vm_full.primary_ip4 = None
-                                            needs_save = True
-                                            logger.debug(f'      Removed primary IPv4 from old VM {old_vm.name}')
-                                    if hasattr(old_vm_full, 'primary_ip6') and old_vm_full.primary_ip6:
-                                        if old_vm_full.primary_ip6.id == nb_ip_address.id:
-                                            old_vm_full.primary_ip6 = None
-                                            needs_save = True
-                                            logger.debug(f'      Removed primary IPv6 from old VM {old_vm.name}')
-                                    if needs_save:
-                                        old_vm_full.save()
-                            except Exception as e:
-                                logger.warning(f'      Warning: Could not remove primary IP from old VM: {e}')
+                        except pynetbox.RequestError as exc2:
+                            if not _is_duplicate_ip_error(exc2):
+                                raise
+                            logger.info(
+                                f'      IP {_virtual_machine_full_address} still duplicates after VRF change; '
+                                f're-assigning existing record to {_nb_virtual_machine.name}'
+                            )
+                            nb_ip_address = _fetch_existing_ip_address(_nb_api, _virtual_machine_full_address) or nb_ip_address
                             nb_ip_address.assigned_object_type = 'virtualization.vminterface'
                             nb_ip_address.assigned_object_id = nb_virtual_machines_interface.id
                             nb_ip_address.dns_name = ip_address_dns_name
+                            nb_ip_address.description = _nb_virtual_machine.name
                             nb_ip_address.save()
-                            logger.info(f'      Successfully re-assigned IP to interface {nb_virtual_machines_interface.name}')
-                        else:
-                            logger.error('      ❌ ERROR: IP address conflict detected!')
-                            logger.error(f'      IP {_virtual_machine_full_address} is used by:')
-                            logger.error(f'         - VM {old_vm.name} (ID: {old_vm.serial}, status: {old_vm_status}, interface: {old_interface.name})')
-                            logger.error(f'         - VM {_nb_virtual_machine.name} (ID: {_nb_virtual_machine.serial}, status: {current_vm_status})')
-                            logger.error(f'      ⚠️  ACTION REQUIRED: Change IP address for one of the VMs!')
-                            logger.error(f'      Skipping IP address assignment for VM {_nb_virtual_machine.name}')
-                            return _nb_objects
+                            _nb_objects['ip_addresses'][nb_ip_address.address] = nb_ip_address
                     else:
+                        # Same VRF (or both global). Reassign to current VM, taking over from old VM
+                        # if needed. This handles VRRP VIPs and offline/online crossovers.
+                        logger.info(
+                            f'      IP {_virtual_machine_full_address} is currently on VM {old_vm.name} '
+                            f'(ID: {old_vm.serial}, status: {old_vm_status}); '
+                            f're-assigning to VM {_nb_virtual_machine.name} (ID: {_nb_virtual_machine.serial})'
+                        )
+                        try:
+                            old_vm_full = _nb_api.virtualization.virtual_machines.get(old_vm.id)
+                            if old_vm_full:
+                                needs_save = False
+                                if hasattr(old_vm_full, 'primary_ip4') and old_vm_full.primary_ip4:
+                                    if old_vm_full.primary_ip4.id == nb_ip_address.id:
+                                        old_vm_full.primary_ip4 = None
+                                        needs_save = True
+                                        logger.debug(f'      Removed primary IPv4 from old VM {old_vm.name}')
+                                if hasattr(old_vm_full, 'primary_ip6') and old_vm_full.primary_ip6:
+                                    if old_vm_full.primary_ip6.id == nb_ip_address.id:
+                                        old_vm_full.primary_ip6 = None
+                                        needs_save = True
+                                        logger.debug(f'      Removed primary IPv6 from old VM {old_vm.name}')
+                                if needs_save:
+                                    old_vm_full.save()
+                        except Exception as e:
+                            logger.warning(f'      Warning: Could not remove primary IP from old VM: {e}')
                         nb_ip_address.assigned_object_type = 'virtualization.vminterface'
                         nb_ip_address.assigned_object_id = nb_virtual_machines_interface.id
                         nb_ip_address.dns_name = ip_address_dns_name
+                        nb_ip_address.description = _nb_virtual_machine.name
                         nb_ip_address.save()
-                except Exception as e:
-                    logger.warning(f'      Warning: Could not verify old interface for IP {_virtual_machine_full_address}: {e}')
-                    logger.warning(f'      Attempting to re-assign IP anyway...')
-                    try:
-                        nb_ip_address.assigned_object_type = 'virtualization.vminterface'
-                        nb_ip_address.assigned_object_id = nb_virtual_machines_interface.id
-                        nb_ip_address.dns_name = ip_address_dns_name
-                        nb_ip_address.save()
-                    except Exception as e2:
-                        logger.error(f'      ❌ ERROR: Failed to re-assign IP: {e2}')
-                        logger.error(f'      Skipping IP address assignment for this interface')
-                        return _nb_objects
-            else:
-                nb_ip_address.dns_name = ip_address_dns_name
-                nb_ip_address.save()
-                logger.debug(f'        ✓ Updated IP {_virtual_machine_full_address} on interface {_interface_name}')
-    else:
+                        logger.info(f'      Successfully re-assigned IP to interface {nb_virtual_machines_interface.name}')
+                else:
+                    nb_ip_address.assigned_object_type = 'virtualization.vminterface'
+                    nb_ip_address.assigned_object_id = nb_virtual_machines_interface.id
+                    nb_ip_address.dns_name = ip_address_dns_name
+                    nb_ip_address.description = _nb_virtual_machine.name
+                    nb_ip_address.save()
+            except Exception as e:
+                logger.warning(f'      Warning: Could not verify old interface for IP {_virtual_machine_full_address}: {e}')
+                logger.warning(f'      Attempting to re-assign IP anyway...')
+                try:
+                    nb_ip_address.assigned_object_type = 'virtualization.vminterface'
+                    nb_ip_address.assigned_object_id = nb_virtual_machines_interface.id
+                    nb_ip_address.dns_name = ip_address_dns_name
+                    nb_ip_address.description = _nb_virtual_machine.name
+                    nb_ip_address.save()
+                except Exception as e2:
+                    logger.error(f'      ❌ ERROR: Failed to re-assign IP: {e2}')
+                    logger.error(f'      Skipping IP address assignment for this interface')
+                    continue
+        else:
+            nb_ip_address.dns_name = ip_address_dns_name
+            nb_ip_address.description = _nb_virtual_machine.name
+            nb_ip_address.save()
+            logger.debug(f'        ✓ Updated IP {_virtual_machine_full_address} on interface {_interface_name}')
+
+    if not ipv4_list:
         logger.debug(f'        Interface {_interface_name}: no IPv4 address found from guest agent')
         if _interface_vlan_id is not None:
             nb_vlan = _nb_objects['vlans'].get(str(_interface_vlan_id))
@@ -1243,13 +1419,6 @@ def _process_pve_disk_size(_raw_disk_size: str) -> int:
         return -1
 
     return -1
-
-
-def _get_virtual_machine_vcpus(_pve_virtual_machine_config: dict) -> int:
-    """Return vCPU count from Proxmox VM config (vcpus if set, else cores * sockets)."""
-    if 'vcpus' in _pve_virtual_machine_config:
-        return _pve_virtual_machine_config['vcpus']
-    return _pve_virtual_machine_config['cores'] * _pve_virtual_machine_config['sockets']
 
 
 def quick_check_changes(_pve_api: ProxmoxAPI, _last_state: dict) -> tuple[list[int], dict]:
