@@ -804,6 +804,18 @@ def _resolve_primary_ip_assignments(
         _nb_virtual_machine.save()
 
 
+def _should_set_ip_description(nb_ip_address) -> bool:
+    """
+    Return True if the IP's ``description`` is empty and can be safely
+    populated with the VM name.
+
+    Existing manual descriptions (e.g. ``'VRRP oxt-vs-nginx0X'``,
+    ``'MGMT IP'``, ``'Файловое хранилище'``) are preserved.
+    """
+    current = getattr(nb_ip_address, 'description', '') or ''
+    return not current.strip()
+
+
 def _fetch_existing_ip_address(_nb_api: pynetbox.api, _address: str):
     """
     Query NetBox for an existing IP address by exact address string.
@@ -1054,10 +1066,16 @@ def _process_pve_virtual_machine_network_interface(
 
         nb_prefix = _nb_objects['prefixes'].get(_prefix_network_full_address)
         if nb_prefix is None:
-            nb_prefix = _nb_api.ipam.prefixes.create(prefix=_prefix_network_full_address)
-            _nb_objects['prefixes'][nb_prefix.prefix] = nb_prefix
+            # Skip /32 (and /128 for IPv6) "prefix" creation: these come from
+            # VIP aliases reported by the QEMU agent and don't represent a real
+            # network. Creating them only pollutes the prefixes table.
+            if _iface_net.prefixlen in (32, 128):
+                nb_prefix = None
+            else:
+                nb_prefix = _nb_api.ipam.prefixes.create(prefix=_prefix_network_full_address)
+                _nb_objects['prefixes'][nb_prefix.prefix] = nb_prefix
 
-        if 'dns_name' in nb_prefix.custom_fields and nb_prefix.custom_fields['dns_name'] is not None:
+        if nb_prefix is not None and 'dns_name' in nb_prefix.custom_fields and nb_prefix.custom_fields['dns_name'] is not None:
             ip_address_dns_name = f'{_nb_virtual_machine.name}.{nb_prefix.custom_fields["dns_name"]}'
         else:
             ip_address_dns_name = ''
@@ -1100,7 +1118,7 @@ def _process_pve_virtual_machine_network_interface(
                     old_vm_status = old_vm.status.value if hasattr(old_vm, 'status') and hasattr(old_vm.status, 'value') else (old_vm.status if hasattr(old_vm, 'status') else 'unknown')
                     current_vm_status = _nb_virtual_machine.status.value if hasattr(_nb_virtual_machine, 'status') and hasattr(_nb_virtual_machine.status, 'value') else (_nb_virtual_machine.status if hasattr(_nb_virtual_machine, 'status') else 'unknown')
                     old_ip_vrf = nb_ip_address.vrf.id if hasattr(nb_ip_address, 'vrf') and nb_ip_address.vrf else None
-                    new_ip_vrf = nb_prefix.vrf.id if hasattr(nb_prefix, 'vrf') and nb_prefix.vrf else None
+                    new_ip_vrf = nb_prefix.vrf.id if nb_prefix is not None and hasattr(nb_prefix, 'vrf') and nb_prefix.vrf else None
                     if old_ip_vrf != new_ip_vrf:
                         old_vrf_name = nb_ip_address.vrf.name if old_ip_vrf else 'Global'
                         new_vrf_name = nb_prefix.vrf.name if new_ip_vrf else 'Global'
@@ -1129,7 +1147,8 @@ def _process_pve_virtual_machine_network_interface(
                             nb_ip_address.assigned_object_type = 'virtualization.vminterface'
                             nb_ip_address.assigned_object_id = nb_virtual_machines_interface.id
                             nb_ip_address.dns_name = ip_address_dns_name
-                            nb_ip_address.description = _nb_virtual_machine.name
+                            if _should_set_ip_description(nb_ip_address):
+                                nb_ip_address.description = _nb_virtual_machine.name
                             nb_ip_address.save()
                             _nb_objects['ip_addresses'][nb_ip_address.address] = nb_ip_address
                     else:
@@ -1161,14 +1180,16 @@ def _process_pve_virtual_machine_network_interface(
                         nb_ip_address.assigned_object_type = 'virtualization.vminterface'
                         nb_ip_address.assigned_object_id = nb_virtual_machines_interface.id
                         nb_ip_address.dns_name = ip_address_dns_name
-                        nb_ip_address.description = _nb_virtual_machine.name
+                        if _should_set_ip_description(nb_ip_address):
+                            nb_ip_address.description = _nb_virtual_machine.name
                         nb_ip_address.save()
                         logger.info(f'      Successfully re-assigned IP to interface {nb_virtual_machines_interface.name}')
                 else:
                     nb_ip_address.assigned_object_type = 'virtualization.vminterface'
                     nb_ip_address.assigned_object_id = nb_virtual_machines_interface.id
                     nb_ip_address.dns_name = ip_address_dns_name
-                    nb_ip_address.description = _nb_virtual_machine.name
+                    if _should_set_ip_description(nb_ip_address):
+                        nb_ip_address.description = _nb_virtual_machine.name
                     nb_ip_address.save()
             except Exception as e:
                 logger.warning(f'      Warning: Could not verify old interface for IP {_virtual_machine_full_address}: {e}')
@@ -1177,7 +1198,8 @@ def _process_pve_virtual_machine_network_interface(
                     nb_ip_address.assigned_object_type = 'virtualization.vminterface'
                     nb_ip_address.assigned_object_id = nb_virtual_machines_interface.id
                     nb_ip_address.dns_name = ip_address_dns_name
-                    nb_ip_address.description = _nb_virtual_machine.name
+                    if _should_set_ip_description(nb_ip_address):
+                        nb_ip_address.description = _nb_virtual_machine.name
                     nb_ip_address.save()
                 except Exception as e2:
                     logger.error(f'      ❌ ERROR: Failed to re-assign IP: {e2}')
@@ -1185,7 +1207,8 @@ def _process_pve_virtual_machine_network_interface(
                     continue
         else:
             nb_ip_address.dns_name = ip_address_dns_name
-            nb_ip_address.description = _nb_virtual_machine.name
+            if _should_set_ip_description(nb_ip_address):
+                nb_ip_address.description = _nb_virtual_machine.name
             nb_ip_address.save()
             logger.debug(f'        ✓ Updated IP {_virtual_machine_full_address} on interface {_interface_name}')
 
