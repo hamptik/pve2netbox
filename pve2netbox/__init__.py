@@ -217,7 +217,8 @@ def _load_nb_objects(_nb_api: pynetbox.api) -> dict:
         _nb_objects['devices'][_nb_device.name.lower()] = _nb_device
     logger.debug('  - Loading virtual machines...')
     vm_ids = []
-    for _nb_virtual_machine in _nb_api.virtualization.virtual_machines.all():
+    cluster_id = _config.nb_cluster_id if _config is not None else int(os.environ.get('NB_CLUSTER_ID', '1'))
+    for _nb_virtual_machine in _nb_api.virtualization.virtual_machines.filter(cluster_id=cluster_id):
         _index_nb_virtual_machine(_nb_objects, _nb_virtual_machine)
         vm_ids.append(_nb_virtual_machine.id)
     logger.debug('  - Loading interfaces...')
@@ -363,11 +364,19 @@ def _get_nb_vm_for_sync(
     Find existing NetBox VM for sync.
     First try serial=vmid cache, then fallback to unique (name, cluster_id).
     """
+    expected_cluster = _config.nb_cluster_id if _config is not None else int(os.environ.get('NB_CLUSTER_ID', '1'))
     vm = _nb_objects['virtual_machines'].get(str(vmid))
     if vm is not None:
-        return vm
+        vm_cluster = getattr(getattr(vm, 'cluster', None), 'id', None)
+        if vm_cluster is not None and int(vm_cluster) != expected_cluster:
+            logger.warning(
+                f'      VM with serial {vmid} found in cluster {vm_cluster}, '
+                f'but expected cluster {expected_cluster}; ignoring (likely vmid collision across clusters)'
+            )
+        else:
+            return vm
 
-    cluster_id = int(os.environ.get('NB_CLUSTER_ID', 1))
+    cluster_id = expected_cluster
     vm = _nb_objects['virtual_machines_by_name_cluster'].get((vm_name, cluster_id))
     if vm is not None:
         return vm
@@ -414,7 +423,7 @@ def _process_pve_lxc_container(
             'serial': _pve_container['vmid'],
             'name': vm_name,
             'site': _nb_device.site.id,
-            'cluster': os.environ.get('NB_CLUSTER_ID', 1),
+            'cluster': _config.nb_cluster_id,
             'device': _nb_device.id,
             'vcpus': pve_container_config.get('cores', 1),
             'memory': int(pve_container_config.get('memory', 512)),
@@ -438,7 +447,7 @@ def _process_pve_lxc_container(
         nb_virtual_machine.serial = _pve_container['vmid']
         nb_virtual_machine.name = vm_name
         nb_virtual_machine.site = _nb_device.site.id
-        nb_virtual_machine.cluster = os.environ.get('NB_CLUSTER_ID', 1)
+        nb_virtual_machine.cluster = _config.nb_cluster_id
         nb_virtual_machine.device = _nb_device.id
         nb_virtual_machine.vcpus = pve_container_config.get('cores', 1)
         nb_virtual_machine.memory = int(pve_container_config.get('memory', 512))
@@ -564,7 +573,7 @@ def _process_pve_virtual_machine(
             'serial': _pve_virtual_machine['vmid'],
             'name': vm_name,
             'site': _nb_device.site.id,
-            'cluster': os.environ.get('NB_CLUSTER_ID', 1),
+            'cluster': _config.nb_cluster_id,
             'device': _nb_device.id,
             'vcpus': _get_virtual_machine_vcpus(pve_virtual_machine_config),
             'memory': int(pve_virtual_machine_config.get('memory', 0) or 0),
@@ -588,7 +597,7 @@ def _process_pve_virtual_machine(
         nb_virtual_machine.serial = _pve_virtual_machine['vmid']
         nb_virtual_machine.name = vm_name
         nb_virtual_machine.site = _nb_device.site.id
-        nb_virtual_machine.cluster = os.environ.get('NB_CLUSTER_ID', 1)
+        nb_virtual_machine.cluster = _config.nb_cluster_id
         nb_virtual_machine.device = _nb_device.id
         nb_virtual_machine.vcpus = _get_virtual_machine_vcpus(pve_virtual_machine_config)
         nb_virtual_machine.memory = int(pve_virtual_machine_config.get('memory', 0) or 0)
@@ -1523,10 +1532,11 @@ def _load_specific_objects(_nb_api: pynetbox.api, _changed_vmids: list[int]) -> 
     logger.debug('  - Loading devices...')
     for _nb_device in _nb_api.dcim.devices.all():
         _nb_objects['devices'][_nb_device.name.lower()] = _nb_device
+    cluster_id = _config.nb_cluster_id if _config is not None else int(os.environ.get('NB_CLUSTER_ID', '1'))
     logger.debug(f'  - Loading {len(_changed_vmids)} specific virtual machines...')
     for vmid in _changed_vmids:
         try:
-            vms = _nb_api.virtualization.virtual_machines.filter(serial=str(vmid))
+            vms = _nb_api.virtualization.virtual_machines.filter(serial=str(vmid), cluster_id=cluster_id)
             for vm in vms:
                 _index_nb_virtual_machine(_nb_objects, vm)
         except Exception as e:
@@ -1713,13 +1723,21 @@ def cleanup_stale_vms(nb_api: pynetbox.api, nb_objects: dict, current_vmids: set
     logger.info('Checking for stale VMs in NetBox...')
     
     stale_vms = []
+    expected_cluster = _config.nb_cluster_id if _config is not None else None
     for serial, nb_vm in nb_objects['virtual_machines'].items():
         try:
             vmid = int(serial)
-            if vmid not in current_vmids:
-                stale_vms.append((vmid, nb_vm))
         except (ValueError, TypeError):
             continue
+        vm_cluster = getattr(getattr(nb_vm, 'cluster', None), 'id', None)
+        if expected_cluster is not None and vm_cluster is not None and int(vm_cluster) != expected_cluster:
+            logger.debug(
+                f'Skipping VM {nb_vm.name} (serial {serial}): belongs to cluster '
+                f'{vm_cluster}, not {expected_cluster}'
+            )
+            continue
+        if vmid not in current_vmids:
+            stale_vms.append((vmid, nb_vm))
     
     if not stale_vms:
         logger.info('No stale VMs found.')
