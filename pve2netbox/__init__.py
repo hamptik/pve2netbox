@@ -1773,53 +1773,239 @@ def sync_specific_vms(
         logger.info('Quick sync completed successfully!')
 
 
-def cleanup_stale_vms(nb_api: pynetbox.api, nb_objects: dict, current_vmids: set, dry_run: bool = False) -> None:
+_absence_counters: Dict[int, int] = {}
+"""In-memory per-vmid absence counters for guarded decommission.
+
+Module-level on purpose: a process restart resets them, which is the safe
+failure mode (a VM must be absent for N consecutive cycles before being
+moved to the decommission cluster; restart simply delays the decision).
+"""
+
+
+def _bump_absence(vmid: int) -> int:
+    """Increment and return the consecutive-absence counter for ``vmid``."""
+    _absence_counters[vmid] = _absence_counters.get(vmid, 0) + 1
+    return _absence_counters[vmid]
+
+
+def _reset_absence(vmid: int) -> None:
+    """Drop the absence counter for ``vmid`` (it was seen again in Proxmox)."""
+    _absence_counters.pop(vmid, None)
+
+
+def compute_reconcile_actions(
+        nb_objects: dict,
+        inventory_vmids: set,
+        cluster_resource_vmids: set,
+        my_cluster_id: int,
+        decommission_cluster_id: Optional[int],
+) -> dict:
     """
-    Remove VMs from NetBox that no longer exist in Proxmox.
-    
-    Args:
-        nb_api: NetBox API instance
-        nb_objects: Dictionary of NetBox objects
-        current_vmids: Set of current VM IDs from Proxmox
-        dry_run: If True, only log what would be deleted
+    Pure reconcile planner: no IO, no access to global _config.
+
+    Sectors:
+    - inventory: vmids currently present in the Proxmox cluster;
+    - my_sector: NetBox VM records with numeric serial in my_cluster_id;
+    - graveyard: NetBox VM records in decommission_cluster_id (may be None).
+
+    Returns:
+        {'adopt_vmids': [int], 'decommission_candidates': [int]}
+        - adopt_vmids: graveyard records whose vmid reappeared in the inventory;
+        - decommission_candidates: my_sector vmids absent both from the
+          inventory and from the cluster-wide resource listing (double-check
+          guards against a single node listing blinking). Duplicate serials
+          are excluded from both lists.
     """
-    logger.info('Checking for stale VMs in NetBox...')
-    
-    stale_vms = []
-    expected_cluster = _config.nb_cluster_id if _config is not None else None
-    for serial, nb_vm in nb_objects['virtual_machines'].items():
+    adopt_vmids = []
+    decommission_candidates = []
+    for serial, vm in nb_objects.get('virtual_machines', {}).items():
         try:
             vmid = int(serial)
         except (ValueError, TypeError):
             continue
-        vm_cluster = getattr(getattr(nb_vm, 'cluster', None), 'id', None)
-        if expected_cluster is not None and vm_cluster is not None and int(vm_cluster) != expected_cluster:
-            logger.debug(
-                f'Skipping VM {nb_vm.name} (serial {serial}): belongs to cluster '
-                f'{vm_cluster}, not {expected_cluster}'
-            )
+        vm_cluster = getattr(getattr(vm, 'cluster', None), 'id', None)
+        if vm_cluster is None:
             continue
-        if vmid not in current_vmids:
-            stale_vms.append((vmid, nb_vm))
-    
-    if not stale_vms:
-        logger.info('No stale VMs found.')
-        return
-    
-    logger.warning(f'Found {len(stale_vms)} stale VM(s) that exist in NetBox but not in Proxmox:')
-    for vmid, nb_vm in stale_vms:
-        logger.warning(f'  - VM {nb_vm.name} (ID: {vmid})')
-    
-    if dry_run:
-        logger.info('[DRY RUN] Would delete these VMs from NetBox')
-        return
-    
-    for vmid, nb_vm in stale_vms:
+        if decommission_cluster_id is not None and int(vm_cluster) == decommission_cluster_id:
+            if vmid in inventory_vmids:
+                adopt_vmids.append(vmid)
+        elif int(vm_cluster) == my_cluster_id:
+            if vmid not in inventory_vmids and vmid not in cluster_resource_vmids:
+                decommission_candidates.append(vmid)
+    return {
+        'adopt_vmids': adopt_vmids,
+        'decommission_candidates': decommission_candidates,
+    }
+
+
+def apply_decommission(_nb_api: pynetbox.api, nb_objects: dict, vmids: list, dry_run: bool) -> int:
+    """
+    Move the given vmids from my cluster into the decommission cluster
+    (soft-delete: cluster=graveyard, status='decommissioning', device=None;
+    primary_ip is intentionally kept so the record stays useful in the graveyard).
+
+    Per-VM errors are logged and counted as metrics, one failure does not
+    stop the others. Returns the number of VMs actually moved (or that would
+    be moved in dry-run mode).
+    """
+    moved = 0
+    from_cluster = _config.nb_cluster_id if _config is not None else None
+    to_cluster = _config.nb_decommission_cluster_id
+    for vmid in vmids:
+        vm = nb_objects['virtual_machines'].get(str(vmid))
+        if vm is None:
+            logger.warning(f'Decommission: no NetBox record for vmid {vmid}, skipping')
+            continue
         try:
-            logger.info(f'Deleting stale VM: {nb_vm.name} (ID: {vmid})')
-            nb_vm.delete()
+            logger.info(
+                f'Decommissioning VM {vm.name} (ID: {vmid}): '
+                f'cluster {getattr(getattr(vm, "cluster", None), "id", None)} -> {to_cluster}, '
+                f'status -> decommissioning, device -> None'
+            )
+            if dry_run:
+                logger.info(f'[DRY RUN] Would move VM {vm.name} (ID: {vmid}) to decommission cluster')
+                moved += 1
+                continue
+            vm.cluster = to_cluster
+            vm.status = 'decommissioning'
+            vm.device = None
+            vm.save()
+            metrics.record_vm_decommissioned()
+            moved += 1
         except Exception as e:
-            logger.error(f'Failed to delete VM {nb_vm.name}: {e}')
+            logger.error(f'Failed to decommission VM {vm.name} (ID: {vmid}): {e}')
+            metrics.record_error()
+    if moved:
+        logger.info(f'Decommissioned {moved} VM(s) from cluster {from_cluster} to {to_cluster}.')
+    return moved
+
+
+def _reconcile_with_objects(
+        nb_api: pynetbox.api,
+        nb_objects: dict,
+        inventory_vmids: set,
+        cluster_resource_vmids: Optional[set],
+) -> dict:
+    """
+    Shared reconcile core used by both the quick cycle and the full sync:
+    plans actions from already-loaded NetBox objects and applies decommission
+    with guards and per-cycle absence counters.
+
+    Guards (decommission pass only; ADOPT is never gated):
+    - empty inventory with a non-empty NetBox sector -> error + skip;
+    - failed cluster/resources fetch -> warning + skip;
+    - ENABLE_CLEANUP=false or no decommission cluster -> skip.
+    """
+    decommission_cluster = _config.nb_decommission_cluster_id
+    my_cluster = _config.nb_cluster_id
+
+    actions = compute_reconcile_actions(
+        nb_objects,
+        inventory_vmids,
+        cluster_resource_vmids if cluster_resource_vmids is not None else set(),
+        my_cluster,
+        decommission_cluster,
+    )
+
+    adopt_vmids = actions['adopt_vmids']
+    if adopt_vmids:
+        logger.info(
+            f'Reconcile: {len(adopt_vmids)} VM(s) re-appeared from decommission cluster, '
+            f'will adopt: {sorted(adopt_vmids)}'
+        )
+
+    # Reset absence counters for vmids that are back in Proxmox.
+    for vmid in set(inventory_vmids) | (cluster_resource_vmids or set()):
+        _reset_absence(vmid)
+
+    decommissioned = 0
+    if not _config.enable_cleanup or decommission_cluster is None:
+        logger.debug('Reconcile: decommission disabled (ENABLE_CLEANUP off or no decommission cluster).')
+    elif not inventory_vmids and nb_objects['virtual_machines']:
+        logger.error(
+            'Reconcile: Proxmox inventory is empty but NetBox sector is not; '
+            'skipping decommission pass (likely PVE API degradation).'
+        )
+    elif cluster_resource_vmids is None:
+        logger.warning('Reconcile: no cluster/resources data, skipping decommission pass.')
+    else:
+        ready_vmids = []
+        for vmid in actions['decommission_candidates']:
+            counter = _bump_absence(vmid)
+            vm_name = getattr(nb_objects['virtual_machines'].get(str(vmid)), 'name', '?')
+            if counter >= _config.decommission_after_cycles:
+                logger.info(
+                    f'Reconcile: VM {vm_name} (ID: {vmid}) absent for {counter} consecutive '
+                    f'cycle(s), queuing decommission.'
+                )
+                ready_vmids.append(vmid)
+            else:
+                logger.info(
+                    f'Reconcile: VM {vm_name} (ID: {vmid}) absent {counter}/'
+                    f'{_config.decommission_after_cycles} cycle(s), waiting.'
+                )
+        if ready_vmids:
+            decommissioned = apply_decommission(nb_api, nb_objects, ready_vmids, _config.dry_run)
+
+    return {
+        'adopt_vmids': adopt_vmids,
+        'decommissioned': decommissioned,
+    }
+
+
+def run_quick_reconcile(pve_api: ProxmoxAPI, nb_api: pynetbox.api, inventory_vmids: set) -> dict:
+    """
+    Stateless reconcile for the quick cycle (and any cycle with an inventory in
+    hand): loads both sectors (graveyard + my cluster) with two NetBox calls,
+    fetches the cluster-wide resource set, then delegates to the shared
+    reconcile core (guards + absence counters + decommission).
+
+    Returns {'adopt_vmids': [...], 'decommissioned': int}; the caller is
+    responsible for syncing adopt_vmids (the decision table will ADOPT them).
+    """
+    decommission_cluster = _config.nb_decommission_cluster_id
+    my_cluster = _config.nb_cluster_id
+
+    nb_objects = {
+        'devices': {},
+        'virtual_machines': {},
+        'virtual_machines_duplicates': {},
+        'virtual_machines_by_name_cluster': {},
+    }
+    try:
+        logger.info('Reconcile: loading NetBox sectors (my cluster + decommission)...')
+        sector_filter_ids = [cid for cid in (my_cluster, decommission_cluster) if cid is not None]
+        for vm in _load_sector_vms(nb_api, sector_filter_ids):
+            _index_nb_virtual_machine(nb_objects, vm)
+        logger.info(f'Reconcile: sector loaded, {len(nb_objects["virtual_machines"])} VM record(s).')
+    except Exception as e:
+        logger.warning(f'Reconcile: failed to load NetBox sectors, skipping this pass: {e}')
+        return {'adopt_vmids': [], 'decommissioned': 0}
+
+    cluster_resource_vmids = None
+    try:
+        cluster_resource_vmids = get_cluster_vmids(pve_api)
+    except Exception as e:
+        logger.warning(f'Reconcile: failed to fetch cluster resources, skipping decommission pass: {e}')
+
+    return _reconcile_with_objects(nb_api, nb_objects, inventory_vmids, cluster_resource_vmids)
+
+
+def _load_sector_vms(nb_api: pynetbox.api, cluster_ids: list):
+    """Load all VM records of the given clusters (2 API calls: one per cluster)."""
+    vms = []
+    for cluster_id in cluster_ids:
+        try:
+            vms.extend(_nb_api_sector_vms(nb_api, cluster_id))
+        except Exception as e:
+            logger.warning(f'Reconcile: failed to load VMs of cluster {cluster_id}: {e}')
+    return vms
+
+
+def _nb_api_sector_vms(nb_api: pynetbox.api, cluster_id: int):
+    """Fetch a single cluster sector from NetBox."""
+    return list(nb_api.virtualization.virtual_machines.filter(cluster_id=cluster_id))
+
 
 
 def main():
@@ -1945,7 +2131,22 @@ def main():
                         exc_info=True,
                     )
     if _config.enable_cleanup:
-        cleanup_stale_vms(nb_api, nb_objects, current_vmids, _config.dry_run)
+        # Full-sync reconcile: current_vmids is the confirmed inventory; adopt
+        # is already handled by the decision table during the per-VM loop above.
+        cluster_resource_vmids = None
+        try:
+            cluster_resource_vmids = get_cluster_vmids(pve_api)
+        except Exception as e:
+            logger.warning(f'Reconcile: failed to fetch cluster resources: {e}')
+        rec = _reconcile_with_objects(nb_api, nb_objects, current_vmids, cluster_resource_vmids)
+        if rec['adopt_vmids']:
+            logger.info(
+                f'Reconcile: syncing {len(rec["adopt_vmids"])} adopted VM(s): {sorted(rec["adopt_vmids"])}'
+            )
+            try:
+                sync_specific_vms(pve_api, nb_api, rec['adopt_vmids'])
+            except Exception as e:
+                logger.error(f'Reconcile: failed to sync adopted VMs {rec["adopt_vmids"]}: {e}', exc_info=True)
     metrics.record_full_sync_end(sync_start_time, vm_count, lxc_count)
     
     if sync_errors:
