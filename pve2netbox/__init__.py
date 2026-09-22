@@ -1514,63 +1514,6 @@ def _process_pve_disk_size(_raw_disk_size: str) -> int:
     return -1
 
 
-def quick_check_changes(_pve_api: ProxmoxAPI, _last_state: dict) -> tuple[list[int], dict]:
-    """
-    Quick check for VM changes without loading full config.
-    Returns (list of changed vmid, current_state dict). Uses SYNC_VMS/SYNC_LXC env.
-    """
-    current_state = {}
-    sync_vms = os.getenv('SYNC_VMS', 'true').lower() == 'true'
-    sync_lxc = os.getenv('SYNC_LXC', 'true').lower() == 'true'
-    ignore_locked = os.getenv('IGNORE_STATUS_WHEN_LOCKED', 'true').lower() == 'true'
-
-    def _resolve_status(entity: dict, prev: dict) -> str:
-        """Reuse last-known status while PVE holds a transient lock (e.g. backup)."""
-        if ignore_locked and entity.get('lock') in TRANSIENT_PVE_LOCKS:
-            prev_status = prev.get('status') if isinstance(prev, dict) else None
-            if prev_status is not None:
-                return prev_status
-        return entity['status']
-
-    for pve_node in _pve_api.nodes.get():
-        node_name = pve_node['node']
-        if sync_vms:
-            try:
-                for vm in _pve_api.nodes(node_name).qemu.get():
-                    current_state[vm['vmid']] = {
-                        'type': 'qemu',
-                        'status': _resolve_status(vm, _last_state.get(vm['vmid'], {})),
-                        'name': vm['name'],
-                        'node': node_name,
-                        'maxmem': vm.get('maxmem', 0),
-                        'maxdisk': vm.get('maxdisk', 0),
-                    }
-            except Exception as e:
-                logger.warning(f'Failed to get QEMU VMs from node {node_name}: {e}')
-        if sync_lxc:
-            try:
-                for ct in _pve_api.nodes(node_name).lxc.get():
-                    current_state[ct['vmid']] = {
-                        'type': 'lxc',
-                        'status': _resolve_status(ct, _last_state.get(ct['vmid'], {})),
-                        'name': ct['name'],
-                        'node': node_name,
-                        'maxmem': ct.get('maxmem', 0),
-                        'maxdisk': ct.get('maxdisk', 0),
-                    }
-            except Exception as e:
-                logger.warning(f'Failed to get LXC containers from node {node_name}: {e}')
-    changed_vmids = []
-    for vmid, data in current_state.items():
-        if vmid not in _last_state or _last_state[vmid] != data:
-            changed_vmids.append(vmid)
-    for vmid in _last_state:
-        if vmid not in current_state:
-            changed_vmids.append(vmid)
-    
-    return changed_vmids, current_state
-
-
 def _load_specific_objects(_nb_api: pynetbox.api, _changed_vmids: list[int]) -> dict:
     """
     Load from NetBox only objects related to the given VM IDs.
@@ -2011,8 +1954,14 @@ def _nb_api_sector_vms(nb_api: pynetbox.api, cluster_id: int):
 def main():
     """
     Main entrypoint: load config, connect to Proxmox and NetBox, provision custom fields
-    and roles, load NetBox objects, then sync all nodes/VMs/LXC. Metrics server is
-    started in __main__.py so it runs once per process, not on every sync cycle.
+    and roles, load NetBox objects, then sync all nodes/VMs/LXC. The node list comes
+    from fetch_cluster_nodes (guarded against empty responses so a PVE API hiccup
+    can never look like "everything deleted"). Per-VM handling goes through the
+    global serial decision table (create/update/adopt/skip); afterwards the
+    stateless sector reconcile runs: VMs gone from Proxmox are decommissioned
+    (moved to the graveyard cluster) instead of hard-deleted, and graveyard
+    records whose vmid re-appeared are adopted back. Metrics server is started
+    in __main__.py so it runs once per process, not on every sync cycle.
     """
     global _config
     _config = load_config()
@@ -2069,7 +2018,14 @@ def main():
     lxc_count = 0
     
     sync_errors = 0
-    for pve_node in pve_api.nodes.get():
+    try:
+        pve_nodes = fetch_cluster_nodes(pve_api)
+    except Exception as e:
+        logger.error(f'Failed to fetch Proxmox node list, aborting sync: {e}')
+        metrics.record_error()
+        log_section('Sync aborted')
+        return
+    for pve_node in pve_nodes:
         logger.info(f'  Processing node: {pve_node["node"]}')
         pve_replicated_virtual_machine_ids = list(
             map(lambda r: r['guest'], pve_api.nodes(pve_node['node']).replication.get())
