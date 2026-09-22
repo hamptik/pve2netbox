@@ -28,6 +28,8 @@ services:
       # Single-run mode: do not set SYNC_INTERVAL_SECONDS and QUICK_CHECK_INTERVAL_SECONDS
       - DRY_RUN=false
       - ENABLE_CLEANUP=false
+      - NB_DECOMMISSION_CLUSTER_ID=17  # create a graveyard cluster in NetBox first
+      - DECOMMISSION_AFTER_CYCLES=2
       - LOG_LEVEL=INFO
       - ENABLE_METRICS=false
       - METRICS_PORT=9090

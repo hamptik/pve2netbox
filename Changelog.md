@@ -1,5 +1,11 @@
 # pve2netbox
 
+## [Unreleased]
+
+### Added
+
+- **Multi-cluster decommission workflow** — with several pve2netbox instances (one per Proxmox cluster) syncing into one NetBox, a VM missing from Proxmox is no longer deleted when `ENABLE_CLEANUP=true`: after `DECOMMISSION_AFTER_CYCLES` (default `2`) confirmed cycles of absence it is moved to the graveyard cluster `NB_DECOMMISSION_CLUSTER_ID` with `status='decommissioning'`. A `vmid` reappearing in Proxmox (cluster migration or vmid reuse) is adopted back from the graveyard automatically — adopt works always, independent of `ENABLE_CLEANUP`; a `vmid` simultaneously live in another cluster is skipped with an error in the log (migration window / collision). New env vars **`NB_DECOMMISSION_CLUSTER_ID`** (required when `ENABLE_CLEANUP=true`; create the graveyard cluster in NetBox first) and **`DECOMMISSION_AFTER_CYCLES`** (default `2`). Documented in README ("Multi-cluster operation: decommission & migration") and contrib samples (Docker, LXC, systemd).
+
 ## [1.0.7] - 2026-05-10
 
 ### Added

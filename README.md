@@ -84,7 +84,9 @@ Common optional variables:
 | `VM_ROLE` / `LXC_ROLE` | — | NetBox device role for VMs / LXC (created if missing) |
 | `SYNC_VMS` / `SYNC_LXC` / `SYNC_TAGS` | `true` | Enable/disable each sync type |
 | `DRY_RUN` | `false` | Log changes without writing to NetBox |
-| `ENABLE_CLEANUP` | `false` | Delete from NetBox VMs missing in PVE (**use with care**) |
+| `ENABLE_CLEANUP` | `false` | Decommission VMs missing in PVE — move them to the graveyard cluster instead of deleting (**use with care**, see [Multi-cluster operation](#multi-cluster-operation-decommission--migration)) |
+| `NB_DECOMMISSION_CLUSTER_ID` | — | NetBox cluster ID of the "graveyard" — required when `ENABLE_CLEANUP=true` |
+| `DECOMMISSION_AFTER_CYCLES` | `2` | Confirmed sync cycles of absence before a missing VM is moved to the graveyard cluster |
 | `PRESERVE_EXTRA_TAGS` | `false` | Keep NetBox VM tags that are not in Proxmox (merge instead of overwrite) |
 | `LOG_LEVEL` | `INFO` | `DEBUG` / `INFO` / `WARNING` / `ERROR` |
 | `ENABLE_METRICS` / `METRICS_PORT` | `false` / `9090` | Prometheus metrics on `/metrics` |
@@ -105,6 +107,16 @@ Interval variables pick the mode:
 | **Combined** (recommended) | `QUICK_CHECK_INTERVAL_SECONDS=60` + `SYNC_INTERVAL_SECONDS=3600` | Quick change-check every minute + full sync every hour |
 
 Repeated syncs only create/update — they never wipe unrelated NetBox data.
+
+---
+
+## Multi-cluster operation: decommission & migration
+
+When several pve2netbox instances (one per Proxmox cluster) sync into the same NetBox, `vmid` is only unique **per cluster** — yet the records live in one NetBox. To keep that safe, the sync treats `vmid` + cluster as a global key and replaces hard deletes with a decommission workflow:
+
+- **Graveyard (decommissioning).** With `ENABLE_CLEANUP=true`, a VM missing from Proxmox is not deleted: after `DECOMMISSION_AFTER_CYCLES` **confirmed** cycles of absence it is moved to the "graveyard" cluster (`NB_DECOMMISSION_CLUSTER_ID`) with `status='decommissioning'` and no device/cluster membership ties to its origin. Create the graveyard cluster in NetBox yourself and put its ID into `NB_DECOMMISSION_CLUSTER_ID`.
+- **Adopt (migration / vmid reuse).** If a `vmid` shows up in Proxmox while its NetBox record sits in the graveyard, the sync **adopts** it back: the record leaves the graveyard and is updated in place in the syncing cluster. This covers cluster-to-cluster migrations and vmid reuse without creating duplicates. Adopt works always — `ENABLE_CLEANUP` is **not** required for it.
+- **Collision (migration window).** If the same `vmid` is live in two clusters at once (e.g. a half-finished migration), the sync skips such a VM and logs an error instead of fighting over the record. Resolve the overlap (finish or roll back the migration) and the next cycle converges.
 
 ---
 
