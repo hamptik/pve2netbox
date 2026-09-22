@@ -16,6 +16,7 @@ import urllib3
 from proxmoxer import ProxmoxAPI, ResourceException
 from urllib3.util.retry import Retry
 
+from .api.proxmox import fetch_cluster_nodes, get_cluster_vmids
 from .config import Config, TRANSIENT_PVE_LOCKS, load_config
 from .logger import logger, log_section
 from .metrics import metrics
@@ -202,6 +203,7 @@ def _load_nb_objects(_nb_api: pynetbox.api) -> dict:
     _nb_objects = {
         'devices': {},
         'virtual_machines': {},
+        'virtual_machines_duplicates': {},
         'virtual_machines_by_name_cluster': {},
         'virtual_machines_interfaces': {},
         'mac_addresses': {},
@@ -215,10 +217,9 @@ def _load_nb_objects(_nb_api: pynetbox.api) -> dict:
     logger.debug('  - Loading devices...')
     for _nb_device in _nb_api.dcim.devices.all():
         _nb_objects['devices'][_nb_device.name.lower()] = _nb_device
-    logger.debug('  - Loading virtual machines...')
+    logger.debug('  - Loading virtual machines (all clusters, serial is global identity)...')
     vm_ids = []
-    cluster_id = _config.nb_cluster_id if _config is not None else int(os.environ.get('NB_CLUSTER_ID', '1'))
-    for _nb_virtual_machine in _nb_api.virtualization.virtual_machines.filter(cluster_id=cluster_id):
+    for _nb_virtual_machine in _nb_api.virtualization.virtual_machines.all():
         _index_nb_virtual_machine(_nb_objects, _nb_virtual_machine)
         vm_ids.append(_nb_virtual_machine.id)
     logger.debug('  - Loading interfaces...')
@@ -342,10 +343,20 @@ def _get_role_id(_nb_objects: dict, role_name_or_id: Optional[str]) -> Optional[
 
 
 def _index_nb_virtual_machine(_nb_objects: dict, _nb_virtual_machine: Any) -> None:
-    """Index VM in local caches by serial and by (name, cluster_id)."""
+    """
+    Index VM in local caches by serial and by (name, cluster_id).
+
+    Serial is the global identity: first VM with a given serial is stored in
+    ``virtual_machines`` (serial -> vm), any further VM sharing the same serial
+    is appended to ``virtual_machines_duplicates`` (serial -> [vm, ...]) so the
+    decision table can SKIP on duplicate records instead of silently picking one.
+    """
     serial = getattr(_nb_virtual_machine, 'serial', None)
     if serial not in (None, ''):
-        _nb_objects['virtual_machines'][str(serial)] = _nb_virtual_machine
+        if str(serial) in _nb_objects['virtual_machines']:
+            _nb_objects['virtual_machines_duplicates'].setdefault(str(serial), []).append(_nb_virtual_machine)
+        else:
+            _nb_objects['virtual_machines'][str(serial)] = _nb_virtual_machine
 
     cluster = getattr(_nb_virtual_machine, 'cluster', None)
     cluster_id = getattr(cluster, 'id', None)
@@ -359,42 +370,86 @@ def _get_nb_vm_for_sync(
         _nb_objects: dict,
         vmid: int,
         vm_name: str,
-) -> Optional[Any]:
+) -> tuple:
     """
-    Find existing NetBox VM for sync.
-    First try serial=vmid cache, then fallback to unique (name, cluster_id).
+    Decide what to do with a Proxmox VM (vmid, name) using the global serial index.
+
+    Decision table (serial is the global VM identity across all NetBox clusters):
+    - no record with serial=vmid, but (name, my_cluster) exists (legacy record
+      without serial) -> ('update', vm) — serial gets written on the update path.
+    - exactly one record with serial=vmid:
+      * in my cluster       -> ('update', vm)
+      * in decommission (graveyard) cluster -> ('adopt', vm): record is revived
+        into my cluster by the regular update path.
+      * in any other cluster -> ('skip', None): foreign live cluster; never
+        create/move (vmid collision signal), error log + metric.
+    - two or more records with serial=vmid -> ('skip', None): ambiguous state,
+      error log + metric; require manual fix.
+
+    Graveyard detection needs ``_config.nb_decommission_cluster_id``; when it is
+    None no graveyard records exist and a foreign cluster is treated as skip.
+
+    Returns (action, vm): ('create', None) | ('update', vm) | ('adopt', vm) |
+    ('skip', None).
     """
     expected_cluster = _config.nb_cluster_id if _config is not None else int(os.environ.get('NB_CLUSTER_ID', '1'))
-    vm = _nb_objects['virtual_machines'].get(str(vmid))
-    if vm is not None:
-        vm_cluster = getattr(getattr(vm, 'cluster', None), 'id', None)
-        if vm_cluster is not None and int(vm_cluster) != expected_cluster:
-            logger.warning(
-                f'      VM with serial {vmid} found in cluster {vm_cluster}, '
-                f'but expected cluster {expected_cluster}; ignoring (likely vmid collision across clusters)'
-            )
-        else:
-            return vm
+    decommission_cluster = _config.nb_decommission_cluster_id if _config is not None else None
 
-    cluster_id = expected_cluster
-    vm = _nb_objects['virtual_machines_by_name_cluster'].get((vm_name, cluster_id))
+    duplicates = _nb_objects['virtual_machines_duplicates'].get(str(vmid)) or []
+    serial_vm = _nb_objects['virtual_machines'].get(str(vmid))
+    records = [serial_vm] + list(duplicates) if serial_vm is not None else list(duplicates)
+
+    if len(records) >= 2:
+        record_clusters = [
+            getattr(getattr(vm, 'cluster', None), 'id', None) for vm in records
+        ]
+        logger.error(
+            f'      Duplicate NetBox records with serial {vmid} '
+            f'(clusters: {record_clusters}); skipping sync for {vm_name} '
+            f'until fixed manually'
+        )
+        metrics.record_duplicate_serial()
+        return 'skip', None
+
+    if len(records) == 1:
+        vm = records[0]
+        vm_cluster = getattr(getattr(vm, 'cluster', None), 'id', None)
+        if vm_cluster is None or int(vm_cluster) == expected_cluster:
+            return 'update', vm
+        if decommission_cluster is not None and int(vm_cluster) == decommission_cluster:
+            logger.info(
+                f'      Adopting VM {vm_name} (serial {vmid}) from decommission '
+                f'cluster {vm_cluster} into cluster {expected_cluster}'
+            )
+            metrics.record_vm_adopted()
+            return 'adopt', vm
+        logger.error(
+            f'      VM with serial {vmid} (name {getattr(vm, "name", vm_name)}) lives in '
+            f'foreign live cluster {vm_cluster}, expected {expected_cluster}; skipping '
+            f'(vmid collision across clusters or migration window)'
+        )
+        metrics.record_foreign_cluster_vmid()
+        return 'skip', None
+
+    # Legacy fallback: record without serial matched by (name, my_cluster).
+    vm = _nb_objects['virtual_machines_by_name_cluster'].get((vm_name, expected_cluster))
     if vm is not None:
-        return vm
+        return 'update', vm
 
     # Important for quick sync: changed VM may not be preloaded if serial is empty.
     try:
-        candidates = list(_nb_api.virtualization.virtual_machines.filter(name=vm_name, cluster_id=cluster_id))
+        candidates = list(_nb_api.virtualization.virtual_machines.filter(name=vm_name, cluster_id=expected_cluster))
     except Exception as e:
-        logger.warning(f'Failed to load VM by name/cluster ({vm_name}, {cluster_id}): {e}')
-        return None
+        logger.warning(f'Failed to load VM by name/cluster ({vm_name}, {expected_cluster}): {e}')
+        return 'skip', None
 
     if not candidates:
-        return None
+        return 'create', None
 
     vm = candidates[0]
     _index_nb_virtual_machine(_nb_objects, vm)
-    logger.info(f'      Matched existing NetBox VM by name+cluster: {vm_name} (cluster {cluster_id})')
-    return vm
+    logger.info(f'      Matched existing NetBox VM by name+cluster: {vm_name} (cluster {expected_cluster})')
+    return 'update', vm
 
 
 def _process_pve_lxc_container(
@@ -417,8 +472,11 @@ def _process_pve_lxc_container(
     lxc_role_id = _get_role_id(_nb_objects, os.getenv('LXC_ROLE'))
     vm_name = pve_container_config.get('hostname', _pve_container['name'])
     is_locked = _is_pve_entity_transiently_locked(_pve_container)
-    nb_virtual_machine = _get_nb_vm_for_sync(_nb_api, _nb_objects, _pve_container['vmid'], vm_name)
-    if nb_virtual_machine is None:
+    action, nb_virtual_machine = _get_nb_vm_for_sync(_nb_api, _nb_objects, _pve_container['vmid'], vm_name)
+    if action == 'skip':
+        # Lookup already logged the reason (foreign cluster / duplicate serial).
+        return _nb_objects
+    if action == 'create':
         create_params = {
             'serial': _pve_container['vmid'],
             'name': vm_name,
@@ -567,8 +625,11 @@ def _process_pve_virtual_machine(
     vm_role_id = _get_role_id(_nb_objects, os.getenv('VM_ROLE'))
     vm_name = _pve_virtual_machine['name']
     is_locked = _is_pve_entity_transiently_locked(_pve_virtual_machine)
-    nb_virtual_machine = _get_nb_vm_for_sync(_nb_api, _nb_objects, _pve_virtual_machine['vmid'], vm_name)
-    if nb_virtual_machine is None:
+    action, nb_virtual_machine = _get_nb_vm_for_sync(_nb_api, _nb_objects, _pve_virtual_machine['vmid'], vm_name)
+    if action == 'skip':
+        # Lookup already logged the reason (foreign cluster / duplicate serial).
+        return _nb_objects
+    if action == 'create':
         create_params = {
             'serial': _pve_virtual_machine['vmid'],
             'name': vm_name,
@@ -1519,6 +1580,7 @@ def _load_specific_objects(_nb_api: pynetbox.api, _changed_vmids: list[int]) -> 
     _nb_objects = {
         'devices': {},
         'virtual_machines': {},
+        'virtual_machines_duplicates': {},
         'virtual_machines_by_name_cluster': {},
         'virtual_machines_interfaces': {},
         'mac_addresses': {},
@@ -1532,11 +1594,12 @@ def _load_specific_objects(_nb_api: pynetbox.api, _changed_vmids: list[int]) -> 
     logger.debug('  - Loading devices...')
     for _nb_device in _nb_api.dcim.devices.all():
         _nb_objects['devices'][_nb_device.name.lower()] = _nb_device
-    cluster_id = _config.nb_cluster_id if _config is not None else int(os.environ.get('NB_CLUSTER_ID', '1'))
     logger.debug(f'  - Loading {len(_changed_vmids)} specific virtual machines...')
     for vmid in _changed_vmids:
         try:
-            vms = _nb_api.virtualization.virtual_machines.filter(serial=str(vmid), cluster_id=cluster_id)
+            # Global serial search (no cluster filter): lookup must also find
+            # records living in the decommission cluster so ADOPT can happen.
+            vms = _nb_api.virtualization.virtual_machines.filter(serial=str(vmid))
             for vm in vms:
                 _index_nb_virtual_machine(_nb_objects, vm)
         except Exception as e:
