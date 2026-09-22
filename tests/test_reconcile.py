@@ -197,7 +197,7 @@ class TestApplyDecommission:
         }
 
     def _add(self, nb_objects, vm):
-        nb_objects['virtual_machines'][str(vm.id)] = vm
+        nb_objects['virtual_machines'][str(vm.serial)] = vm
 
     def test_dry_run_changes_nothing(self, nb_objects):
         """dry_run=True: no save(), no attribute changes, not counted."""
@@ -224,7 +224,7 @@ class TestApplyDecommission:
 
         assert moved == 1
         assert vm.save_calls == 1
-        assert vm.cluster.id == GRAVEYARD
+        assert vm.cluster == GRAVEYARD  # int after apply_decommission writes it
         assert vm.status == 'decommissioning'
         assert vm.device is None
 
@@ -280,10 +280,11 @@ class TestMigrationAToBPhases:
         )
         assert result == {'adopt_vmids': [], 'decommission_candidates': []}
 
-        # --- Phase 2: record moved to the graveyard; cluster A no longer has
-        # the vmid in its inventory nor in its cluster resources -> candidate.
-        record_in_graveyard = _nb_vm_with_cluster(11, name, self.GRAVEYARD, serial=vmid)
-        nb_objects = _nb_objects_with([record_in_graveyard])
+        # --- Phase 2: cluster A no longer has the vmid in its inventory nor in
+        # its cluster resources, and the record is still in cluster A
+        # (run from A's side) -> decommission candidate.
+        record_still_in_a = _nb_vm_with_cluster(11, name, self.OTHER, serial=vmid)
+        nb_objects = _nb_objects_with([record_still_in_a])
 
         result = pve2netbox.compute_reconcile_actions(
             nb_objects,
@@ -295,7 +296,12 @@ class TestMigrationAToBPhases:
         assert result['adopt_vmids'] == []
         assert result['decommission_candidates'] == [vmid]
 
-        # --- Phase 3: from B's side, graveyard record + B inventory -> adopt.
+        # --- Phase 3: from B's side, the record has been moved to the
+        # graveyard (by A's decommission pass) and B's inventory has the
+        # vmid -> adopt.
+        record_in_graveyard = _nb_vm_with_cluster(11, name, self.GRAVEYARD, serial=vmid)
+        nb_objects = _nb_objects_with([record_in_graveyard])
+
         result = pve2netbox.compute_reconcile_actions(
             nb_objects,
             inventory_vmids={vmid},

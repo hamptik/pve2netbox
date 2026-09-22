@@ -65,6 +65,25 @@ class RecordingAPI:
         raise AssertionError(f'unexpected API access: {name}')
 
 
+class LegacyLookupAPI:
+    """Allows exactly the legacy name+cluster lookup, returns no candidates.
+
+    ``virtualization.virtual_machines.filter(...)`` yields an empty list;
+    any other chained access behaves the same (returns empty), which is
+    enough for the create-path tests.
+    """
+
+    class _Endpoint:
+        def __call__(self, **kwargs):
+            return []
+
+        def __getattr__(self, name):
+            return LegacyLookupAPI._Endpoint()
+
+    def __getattr__(self, name):
+        return LegacyLookupAPI._Endpoint()
+
+
 def make_fake_config(nb_cluster_id=1, nb_decommission_cluster_id=9):
     """Build a stand-in for pve2netbox._config with just the fields needed."""
 
@@ -90,7 +109,7 @@ def make_nb_objects(*vms):
     for vm in vms:
         if vm.serial:
             if vm.serial in objects['virtual_machines']:
-                objects['virtual_machines_duplicates'][vm.serial] = vm
+                objects['virtual_machines_duplicates'].setdefault(vm.serial, []).append(vm)
             else:
                 objects['virtual_machines'][vm.serial] = vm
         objects['virtual_machines_by_name_cluster'][(vm.name, int(vm.cluster.id))] = vm
@@ -99,8 +118,15 @@ def make_nb_objects(*vms):
 
 @pytest.fixture(autouse=True)
 def isolate_module_state(monkeypatch):
-    """Save/restore global pve2netbox state around every test."""
+    """Save/restore global pve2netbox state around every test.
+
+    Also installs a default fake _config (my cluster 1, graveyard 9): code
+    under test reads module-level _config (e.g. apply_decommission), and
+    leaving it None would only be realistic for the very first import.
+    Test modules override it with their own autouse fixtures where needed.
+    """
     saved_config = getattr(pve2netbox, '_config', None)
+    monkeypatch.setattr(pve2netbox, '_config', make_fake_config(), raising=False)
     monkeypatch.setattr(
         pve2netbox, '_absence_counters', {}, raising=False,
     )

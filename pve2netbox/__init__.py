@@ -1761,10 +1761,14 @@ def compute_reconcile_actions(
     """
     adopt_vmids = []
     decommission_candidates = []
+    duplicates = nb_objects.get('virtual_machines_duplicates', {}) or {}
     for serial, vm in nb_objects.get('virtual_machines', {}).items():
         try:
             vmid = int(serial)
         except (ValueError, TypeError):
+            continue
+        if serial in duplicates:
+            # Ambiguous identity: never act on a duplicated serial automatically.
             continue
         vm_cluster = getattr(getattr(vm, 'cluster', None), 'id', None)
         if vm_cluster is None:
@@ -1788,8 +1792,8 @@ def apply_decommission(_nb_api: pynetbox.api, nb_objects: dict, vmids: list, dry
     primary_ip is intentionally kept so the record stays useful in the graveyard).
 
     Per-VM errors are logged and counted as metrics, one failure does not
-    stop the others. Returns the number of VMs actually moved (or that would
-    be moved in dry-run mode).
+    stop the others. Returns the number of VMs actually moved; in dry-run
+    mode nothing is counted (only logged).
     """
     moved = 0
     from_cluster = _config.nb_cluster_id if _config is not None else None
@@ -1807,7 +1811,6 @@ def apply_decommission(_nb_api: pynetbox.api, nb_objects: dict, vmids: list, dry
             )
             if dry_run:
                 logger.info(f'[DRY RUN] Would move VM {vm.name} (ID: {vmid}) to decommission cluster')
-                moved += 1
                 continue
             vm.cluster = to_cluster
             vm.status = 'decommissioning'

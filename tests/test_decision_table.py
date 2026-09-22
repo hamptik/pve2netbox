@@ -11,6 +11,7 @@ import pve2netbox
 
 from .conftest import (
     FakeVM,
+    LegacyLookupAPI,
     RecordingAPI,
     SentinelAPI,
     make_fake_config,
@@ -29,10 +30,15 @@ def _fake_config(monkeypatch):
     )
 
 
-def test_no_record_returns_create():
-    """No record anywhere -> ('create', None)."""
+def test_no_record_returns_create(monkeypatch):
+    """No record anywhere -> ('create', None).
+
+    The legacy fallback legitimately queries the API (records without serial
+    are not indexed), so a LegacyLookupAPI (empty result) stands in for it.
+    """
+    monkeypatch.setattr(pve2netbox, '_config', make_fake_config())
     nb_objects = make_nb_objects()
-    action, vm = pve2netbox._get_nb_vm_for_sync(SentinelAPI(), nb_objects, 100, 'web01')
+    action, vm = pve2netbox._get_nb_vm_for_sync(LegacyLookupAPI(), nb_objects, 100, 'web01')
     assert action == 'create'
     assert vm is None
 
