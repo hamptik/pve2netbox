@@ -41,7 +41,37 @@ class _RateLimitRetryAdapter(requests.adapters.HTTPAdapter):
     def send(self, request, **kwargs):
         if self._delay_seconds > 0:
             time.sleep(self._delay_seconds)
-        return super().send(request, **kwargs)
+        response = super().send(request, **kwargs)
+        _raise_if_redirect(response)
+        return response
+
+
+def _raise_if_redirect(response) -> None:
+    """
+    Fail loudly when the NetBox API answers with a redirect.
+
+    Silently following a redirect downgrades writes to GET (the http->https
+    301 in front of one NetBox made every POST/PATCH a no-op: tag creation
+    returned the tag *list* and pynetbox built a record without fields,
+    crashing later with ``object has no attribute "name"``). A correctly
+    configured ``NB_API_URL`` never gets a 3xx from the NetBox API, so any
+    redirect means the URL must be fixed (e.g. use the final https:// URL).
+    """
+    status = getattr(response, 'status_code', None)
+    if status not in (301, 302, 303, 307, 308):
+        return
+    headers = getattr(response, 'headers', None) or {}
+    location = headers.get('Location')
+    request = getattr(response, 'request', None)
+    method = getattr(request, 'method', '?')
+    url = getattr(response, 'url', '?')
+    raise RuntimeError(
+        f'NetBox API returned HTTP {status} redirect'
+        + (f' to {location}' if location else '')
+        + f' for {method} {url}. Refusing to follow: a followed redirect silently'
+          ' downgrades POST/PATCH/DELETE to GET. Fix NB_API_URL to the final URL'
+          ' (e.g. https://...).'
+    )
 
 
 def _make_netbox_session() -> requests.Session:
@@ -49,6 +79,7 @@ def _make_netbox_session() -> requests.Session:
     delay = float(os.getenv('NB_API_DELAY_SECONDS', '0.2'))
     retry_total = int(os.getenv('NB_API_RETRY_TOTAL', '5'))
     retry_backoff = float(os.getenv('NB_API_RETRY_BACKOFF', '1.0'))
+    verify_ssl = os.getenv('NB_API_VERIFY_SSL', 'true').lower() == 'true'
 
     retries = Retry(
         total=retry_total,
@@ -58,6 +89,7 @@ def _make_netbox_session() -> requests.Session:
     )
     adapter = _RateLimitRetryAdapter(delay_seconds=delay, retry=retries)
     session = requests.Session()
+    session.verify = verify_ssl
     session.mount('http://', adapter)
     session.mount('https://', adapter)
     return session
