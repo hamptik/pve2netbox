@@ -18,6 +18,27 @@ def create_proxmox_api(config: Config) -> ProxmoxAPI:
     )
 
 
+def get_cluster_vmids(pve_api: ProxmoxAPI) -> set:
+    """
+    Return set of all vmids known to the cluster via /cluster/resources?type=vm.
+    Raises on API errors (caller decides how to degrade).
+    """
+    resources = pve_api.cluster.resources.get(type='vm')
+    return {int(r['vmid']) for r in resources}
+
+
+def fetch_cluster_nodes(pve_api: ProxmoxAPI) -> list:
+    """
+    Fetch cluster node list; raise RuntimeError on API error OR empty list.
+    Empty node list from a healthy cluster means API degradation — treating it
+    as "no VMs" would decommission the whole sector, so we refuse to continue.
+    """
+    nodes = pve_api.nodes.get()  # exceptions propagate as-is
+    if not nodes:
+        raise RuntimeError('Proxmox returned an empty node list — aborting to avoid false decommission')
+    return nodes
+
+
 def quick_check_changes(pve_api: ProxmoxAPI, last_state: Dict, config: Config) -> Tuple[List[int], Dict]:
     """
     Quick check for VM changes without loading full configuration.

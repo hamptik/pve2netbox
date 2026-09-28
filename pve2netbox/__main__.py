@@ -5,6 +5,11 @@ Supports three modes:
 - **Simple mode**: only SYNC_INTERVAL_SECONDS set — full sync in a loop at that interval.
 - **Combined mode**: QUICK_CHECK_INTERVAL_SECONDS set — quick checks at that interval,
   full sync at SYNC_INTERVAL_SECONDS (default 3600s); reuses API connections.
+  Every quick check also runs the stateless sector reconcile: graveyard records
+  whose vmid re-appeared in Proxmox are adopted back into the live cluster, and
+  VMs confirmed absent (inventory + cluster resources) for
+  DECOMMISSION_AFTER_CYCLES consecutive cycles are moved to the decommission
+  cluster instead of being hard-deleted.
 - **Single run**: no intervals — one full sync then exit.
 """
 import os
@@ -14,11 +19,11 @@ import urllib3
 import pynetbox
 from proxmoxer import ProxmoxAPI
 
-from pve2netbox import main, quick_check_changes, sync_specific_vms, _make_netbox_session
+from pve2netbox import main, run_quick_reconcile, sync_specific_vms, _make_netbox_session
 from pve2netbox.config import load_config
 from pve2netbox.logger import logger, log_section, log_subsection
 from pve2netbox.metrics import start_metrics_server, metrics
-from pve2netbox.api.proxmox import quick_check_changes as quick_check_changes_new
+from pve2netbox.api.proxmox import quick_check_changes
 
 if __name__ == '__main__':
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -77,9 +82,11 @@ if __name__ == '__main__':
         last_full_sync = time.time() if initial_full_sync_ok else 0
         log_subsection('Initializing quick check state')
         try:
-            _, last_quick_state = quick_check_changes_new(pve_api, {}, config)
-        except Exception:
-            _, last_quick_state = quick_check_changes(pve_api, {})
+            _, last_quick_state = quick_check_changes(pve_api, {}, config)
+        except Exception as e:
+            logger.error(f'Failed to initialize quick check state: {e}')
+            metrics.record_error()
+            last_quick_state = {}
         logger.info(f'Tracking {len(last_quick_state)} VMs for changes')
         if not initial_full_sync_ok:
             logger.warning(
@@ -100,21 +107,20 @@ if __name__ == '__main__':
                     metrics.record_error()
                 last_full_sync = current_time
                 try:
-                    _, last_quick_state = quick_check_changes_new(pve_api, {}, config)
-                except Exception:
-                    _, last_quick_state = quick_check_changes(pve_api, {})
+                    _, last_quick_state = quick_check_changes(pve_api, {}, config)
+                except Exception as e:
+                    logger.error(f'Failed to refresh quick check state after full sync: {e}')
+                    metrics.record_error()
+                    last_quick_state = {}
                 logger.info(f'Full sync completed. Tracking {len(last_quick_state)} VMs.')
                 continue
 
             log_subsection(f'Quick check ({int(current_time - last_full_sync)}s since last full sync)')
             try:
-                try:
-                    changed_vmids, last_quick_state = quick_check_changes_new(pve_api, last_quick_state, config)
-                except Exception:
-                    changed_vmids, last_quick_state = quick_check_changes(pve_api, last_quick_state)
-                
+                changed_vmids, last_quick_state = quick_check_changes(pve_api, last_quick_state, config)
+
                 metrics.record_quick_check(len(changed_vmids))
-                
+
                 if changed_vmids:
                     logger.info(f'Changes detected in {len(changed_vmids)} VM(s): {changed_vmids}')
                     sync_specific_vms(pve_api, nb_api, changed_vmids)
@@ -123,6 +129,22 @@ if __name__ == '__main__':
             except Exception as e:
                 logger.error(f'Error during quick check: {e}', exc_info=True)
                 logger.info('Will retry on next check cycle.')
+                metrics.record_error()
+
+            # Stateless reconcile: adoption of re-appeared VMs and guarded
+            # decommission of confirmed-absent ones (inventory from the quick
+            # check is the per-cycle view of Proxmox).
+            try:
+                inventory = set(last_quick_state.keys())
+                rec = run_quick_reconcile(pve_api, nb_api, inventory)
+                if rec['adopt_vmids']:
+                    logger.info(
+                        f'Reconcile: syncing {len(rec["adopt_vmids"])} adopted VM(s): '
+                        f'{sorted(rec["adopt_vmids"])}'
+                    )
+                    sync_specific_vms(pve_api, nb_api, rec['adopt_vmids'])
+            except Exception as e:
+                logger.error(f'Error during reconcile: {e}', exc_info=True)
                 metrics.record_error()
 
     else:

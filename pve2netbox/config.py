@@ -20,6 +20,10 @@ class Config:
     Sync: sync_vms, sync_lxc, sync_tags, sync_interval_seconds, quick_check_interval_seconds.
     Roles: vm_role, lxc_role (optional device role names).
     Feature flags: dry_run, enable_cleanup, enable_metrics, metrics_port.
+    Multi-cluster/decommission: nb_decommission_cluster_id (NetBox cluster id of the
+    "cluster graveyard" where decommissioned VMs are moved instead of being deleted;
+    required when enable_cleanup is true), decommission_after_cycles (number of
+    consecutive sync cycles a VM must stay missing before it is decommissioned).
     """
     pve_api_host: str
     pve_api_user: str
@@ -45,6 +49,8 @@ class Config:
     metrics_port: int
     ignore_status_when_locked: bool
     preserve_extra_tags: bool
+    nb_decommission_cluster_id: Optional[int] = None
+    decommission_after_cycles: int = 2
     primary_subnets: Tuple[IPNetwork, ...] = field(default_factory=tuple)
 
 
@@ -88,6 +94,25 @@ def load_config() -> Config:
             print(f'  - {error}', file=sys.stderr)
         sys.exit(1)
 
+    # Multi-cluster decommission settings must be validated before Config creation:
+    # cleanup without a "cluster graveyard" would physically delete VM records.
+    enable_cleanup = os.getenv('ENABLE_CLEANUP', 'false').lower() == 'true'
+    if enable_cleanup and not os.getenv('NB_DECOMMISSION_CLUSTER_ID'):
+        print('Configuration error: ENABLE_CLEANUP=true requires '
+              'NB_DECOMMISSION_CLUSTER_ID to be set', file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        decommission_after_cycles = int(os.getenv('DECOMMISSION_AFTER_CYCLES', '2'))
+    except ValueError as e:
+        print(f'Configuration parsing error: DECOMMISSION_AFTER_CYCLES: {e}',
+              file=sys.stderr)
+        sys.exit(1)
+    if decommission_after_cycles < 1:
+        print('Configuration error: DECOMMISSION_AFTER_CYCLES must be >= 1, '
+              f'got {decommission_after_cycles}', file=sys.stderr)
+        sys.exit(1)
+
     primary_subnets = _parse_primary_subnets(os.getenv('PRIMARY_SUBNETS'))
 
     try:
@@ -118,6 +143,8 @@ def load_config() -> Config:
             metrics_port=int(os.getenv('METRICS_PORT', '9090')),
             ignore_status_when_locked=os.getenv('IGNORE_STATUS_WHEN_LOCKED', 'true').lower() == 'true',
             preserve_extra_tags=os.getenv('PRESERVE_EXTRA_TAGS', 'false').lower() == 'true',
+            nb_decommission_cluster_id=int(os.getenv('NB_DECOMMISSION_CLUSTER_ID')) if os.getenv('NB_DECOMMISSION_CLUSTER_ID') else None,  # type: ignore
+            decommission_after_cycles=decommission_after_cycles,
             primary_subnets=primary_subnets,
         )
     except (ValueError, TypeError) as e:

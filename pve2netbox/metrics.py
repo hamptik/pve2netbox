@@ -21,6 +21,14 @@ class SyncMetrics:
         last_sync_duration_seconds: Duration of last sync in seconds (gauge).
         last_sync_timestamp: Timestamp of last successful sync (gauge).
         changes_detected: Number of changes detected in last quick check (gauge).
+        vms_adopted_total: Total number of VM records adopted from the decommission
+            cluster back onto their home cluster (counter).
+        vms_decommissioned_total: Total number of VM records moved to the decommission
+            cluster instead of being deleted (counter).
+        vmid_in_foreign_cluster_total: Total number of VMIDs seen in a foreign live
+            cluster, causing the local instance to be skipped (counter).
+        vmid_duplicate_records_total: Total number of duplicate serial (vmid) records
+            detected in NetBox (counter).
     """
     full_syncs_total: int = 0
     quick_checks_total: int = 0
@@ -32,6 +40,10 @@ class SyncMetrics:
     last_sync_duration_seconds: float = 0.0
     last_sync_timestamp: float = 0.0
     changes_detected: int = 0
+    vms_adopted_total: int = 0
+    vms_decommissioned_total: int = 0
+    vmid_in_foreign_cluster_total: int = 0
+    vmid_duplicate_records_total: int = 0
     
     def record_full_sync_start(self) -> float:
         """Record start of full sync and return start time."""
@@ -62,6 +74,22 @@ class SyncMetrics:
     def record_error(self) -> None:
         """Record error."""
         self.errors_total += 1
+
+    def record_vm_adopted(self) -> None:
+        """Record VM adopted from the decommission cluster onto its home cluster."""
+        self.vms_adopted_total += 1
+
+    def record_vm_decommissioned(self) -> None:
+        """Record VM moved to the decommission cluster instead of deletion."""
+        self.vms_decommissioned_total += 1
+
+    def record_foreign_cluster_vmid(self) -> None:
+        """Record VMID found in a foreign live cluster (instance skipped)."""
+        self.vmid_in_foreign_cluster_total += 1
+
+    def record_duplicate_serial(self) -> None:
+        """Record duplicate serial (vmid) record detected in NetBox."""
+        self.vmid_duplicate_records_total += 1
     
     def get_prometheus_metrics(self) -> str:
         """
@@ -109,6 +137,22 @@ pve2netbox_last_sync_timestamp_seconds {self.last_sync_timestamp:.0f}
 # HELP pve2netbox_changes_detected Number of changes detected in last quick check
 # TYPE pve2netbox_changes_detected gauge
 pve2netbox_changes_detected {self.changes_detected}
+
+# HELP pve2netbox_vms_adopted_total Total number of VMs adopted from the decommission cluster
+# TYPE pve2netbox_vms_adopted_total counter
+pve2netbox_vms_adopted_total {self.vms_adopted_total}
+
+# HELP pve2netbox_vms_decommissioned_total Total number of VMs moved to the decommission cluster
+# TYPE pve2netbox_vms_decommissioned_total counter
+pve2netbox_vms_decommissioned_total {self.vms_decommissioned_total}
+
+# HELP pve2netbox_vmid_in_foreign_cluster_total Total number of VMIDs found in a foreign live cluster
+# TYPE pve2netbox_vmid_in_foreign_cluster_total counter
+pve2netbox_vmid_in_foreign_cluster_total {self.vmid_in_foreign_cluster_total}
+
+# HELP pve2netbox_vmid_duplicate_records_total Total number of duplicate serial (vmid) records detected
+# TYPE pve2netbox_vmid_duplicate_records_total counter
+pve2netbox_vmid_duplicate_records_total {self.vmid_duplicate_records_total}
 """
 
 
