@@ -14,7 +14,10 @@ class Config:
     """
     Configuration for pve2netbox.
 
-    Proxmox: pve_api_host, pve_api_user, pve_api_token, pve_api_secret, pve_api_verify_ssl.
+    Proxmox: pve_api_host, pve_api_user, pve_api_token, pve_api_secret, pve_api_verify_ssl,
+    pve_api_timeout (per-request timeout in seconds for the Proxmox API client;
+    proxmoxer's own default of 5s causes ReadTimeout on slow /nodes/{node}/qemu
+    responses, so the default here is 60).
     NetBox: nb_api_url, nb_api_token, nb_cluster_id, nb_api_delay_seconds,
     nb_api_retry_total, nb_api_retry_backoff.
     Sync: sync_vms, sync_lxc, sync_tags, sync_interval_seconds, quick_check_interval_seconds.
@@ -26,6 +29,7 @@ class Config:
     pve_api_token: str
     pve_api_secret: str
     pve_api_verify_ssl: bool
+    pve_api_timeout: int
     nb_api_url: str
     nb_api_token: str
     nb_cluster_id: int
@@ -97,6 +101,7 @@ def load_config() -> Config:
             pve_api_token=pve_api_token,  # type: ignore
             pve_api_secret=pve_api_secret,  # type: ignore
             pve_api_verify_ssl=os.getenv('PVE_API_VERIFY_SSL', 'false').lower() == 'true',
+            pve_api_timeout=int(os.getenv('PVE_API_TIMEOUT', '60')),
             nb_api_url=nb_api_url,  # type: ignore
             nb_api_token=nb_api_token,  # type: ignore
             nb_cluster_id=int(os.getenv('NB_CLUSTER_ID', '1')),

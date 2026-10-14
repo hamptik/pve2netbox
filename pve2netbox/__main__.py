@@ -55,6 +55,7 @@ if __name__ == '__main__':
             token_name=config.pve_api_token,
             token_value=config.pve_api_secret,
             verify_ssl=config.pve_api_verify_ssl,
+            timeout=config.pve_api_timeout,
         )
         
         nb_api = pynetbox.api(
