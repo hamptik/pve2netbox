@@ -2010,6 +2010,7 @@ def main():
         token_name=_config.pve_api_token,
         token_value=_config.pve_api_secret,
         verify_ssl=_config.pve_api_verify_ssl,
+        timeout=_config.pve_api_timeout,
     )
     nb_api = pynetbox.api(
         url=_config.nb_api_url,

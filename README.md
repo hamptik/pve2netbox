@@ -81,6 +81,7 @@ Common optional variables:
 |----------|---------|-------------|
 | `NB_CLUSTER_ID` | — | NetBox cluster ID |
 | `PVE_API_VERIFY_SSL` | `true` | Verify PVE SSL cert |
+| `PVE_API_TIMEOUT` | `60` | Per-request timeout (seconds) for the Proxmox API client; proxmoxer's built-in default is 5s, which is too low for large clusters |
 | `VM_ROLE` / `LXC_ROLE` | — | NetBox device role for VMs / LXC (created if missing) |
 | `SYNC_VMS` / `SYNC_LXC` / `SYNC_TAGS` | `true` | Enable/disable each sync type |
 | `DRY_RUN` | `false` | Log changes without writing to NetBox |
